@@ -2,8 +2,6 @@
 
 > Autonomous AI hiring pipeline powered by multi-agent orchestration, Circle Nanopayments on Arc L1, and real-time candidate intelligence.
 
-Built for the **Agentic Economy on Arc** hackathon (lablab.ai · April 20–26, 2026).
-
 ---
 
 ## What It Does
