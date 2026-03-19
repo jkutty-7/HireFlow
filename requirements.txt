@@ -1,0 +1,37 @@
+# ─── Web Framework ────────────────────────────────────────────
+fastapi>=0.115.12
+uvicorn[standard]>=0.32.1
+websockets==13.1
+python-multipart==0.0.20
+
+# ─── LLM / Agent Framework ───────────────────────────────────
+langchain==0.3.25
+langchain-core==0.3.58
+langchain-anthropic==0.3.12
+langchain-nvidia-ai-endpoints==0.3.9
+langgraph==0.2.73
+
+# ─── HTTP / Async ────────────────────────────────────────────
+httpx==0.28.1
+aiohttp==3.11.11
+
+# ─── Database ────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# ─── Blockchain / Crypto ─────────────────────────────────────
+web3>=7.6.0
+eth-account>=0.13.7
+vyper>=0.4.2
+titanoboa>=0.2.8
+
+# ─── Validation / Config ─────────────────────────────────────
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# ─── Utilities ───────────────────────────────────────────────
+python-jose==3.3.0
+tenacity==9.0.0
+structlog==24.4.0
