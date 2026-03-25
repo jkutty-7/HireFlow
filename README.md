@@ -11,13 +11,17 @@ HireFlow replaces a full recruitment team with a swarm of specialized AI agents.
 ```
 Recruiter → POST /api/search
                ↓
+         JD Enhancement Agent (Kimi K2.5)    ← NEW: expands brief JDs
+               ↓
          JD Parser Agent (Kimi K2.5)
                ↓
-         Apollo Agent  →  GitHub Agent  →  Hunter Agent  (parallel)
+         Apollo Agent  →  GitHub Agent + Hunter Agent  (true parallel)
                ↓
-         Scoring Agent (Claude Sonnet 4.5)
+         Scoring Agent (Claude Sonnet 4.6)   ← semantic skill matching
                ↓
-         Ranked candidates + payment feed over WebSocket
+         Talent Intelligence Agent (Claude Sonnet 4.6)  ← NEW: insights + interview questions
+               ↓
+         Ranked candidates + intelligence report + payment feed over WebSocket
 ```
 
 ---
@@ -28,12 +32,62 @@ Recruiter → POST /api/search
 
 | Agent | Model | Role |
 |---|---|---|
+| JD Enhancement | Kimi K2.5 (NVIDIA NIM) | Expands abbreviated JDs, adds implied skills and search titles |
 | JD Parser | Kimi K2.5 (NVIDIA NIM) | Extracts skills, seniority, titles from free-text JD |
-| Apollo Agent | Kimi K2.5 | Searches + enriches candidates via Apollo.io |
+| Apollo Agent | Kimi K2.5 | Searches + enriches candidates via Apollo.io; retries with relaxed params on thin results |
 | GitHub Agent | Kimi K2.5 | Fetches repos, languages, activity score (0-100) |
-| Hunter Agent | Kimi K2.5 | Finds + verifies professional emails |
-| Scoring Agent | Claude Sonnet 4.5 | Multi-factor AI scoring with justification |
+| Hunter Agent | Kimi K2.5 | Finds + verifies professional emails using real company domains |
+| Scoring Agent | Claude Sonnet 4.6 | Structured per-skill semantic matching + deterministic composite scoring |
+| Talent Intelligence | Claude Sonnet 4.6 | Post-pool analysis: top-3 summary, red flags, interview questions per candidate |
 | Orchestrator | LangGraph | State machine coordinating all agents |
+
+### Candidate Scoring
+
+Scoring uses two LLM calls per candidate for accuracy:
+
+1. **Structured skill match** — per-skill semantic comparison returns `matched/unmatched` with reasoning. `skill_match_pct` is computed from the count in Python, not delegated to the LLM.
+2. **Seniority + justification** — 4-5 sentence assessment covering strengths, skill gaps, seniority fit, and an actionable interviewer note.
+
+Composite score is computed deterministically in Python:
+
+```
+All inputs normalised to 0-100 before weighting:
+
+composite_score =
+    skill_match_pct  × 0.40   (structured semantic matching)
+  + github_score     × 0.30   (log-scale stars + weighted events + language match)
+  + seniority_fit    × 0.20   (match=100, over=50, under=25 normalised)
+  + email_validity   × 0.10   (verified=100, unverified=50, missing=0 normalised)
+```
+
+### GitHub Scoring
+
+```
+stars_score    = log(1 + total_stars) / log(1001) × 50   (log scale — fair for any level)
+language_score = (matching_languages / required) × 30     (alias-normalised: js=javascript, ts=typescript)
+activity_score = min(weighted_events × 1.5, 20)           (PR×3, Issue×2, Push×1 — quality over frequency)
+github_score   = stars_score + language_score + activity_score
+```
+
+### Talent Intelligence Report
+
+After scoring, `TalentIntelligenceAgent` produces a report stored on every search:
+
+- **Top-3 summary** — executive paragraph on the strongest candidates and why
+- **Search quality score** (0-100) — how good was this candidate pool?
+- **Red flags** — job-hopping (avg tenure < 12 months), overqualified, location mismatch, thin pool
+- **JD improvement suggestions** — if results were poor, what to change in the JD
+- **Interview plans** — 3 targeted questions per top-5 candidate, based on their specific skill gaps
+
+### LinkedIn Signals (from Apollo data)
+
+Employment history from Apollo enrichment is analysed to surface:
+
+- `avg_tenure_months` — average time per role across career
+- `is_job_hopper` — avg tenure < 12 months with 3+ roles
+- `career_trajectory` — ascending / lateral / descending / unknown
+
+These feed directly into the Talent Intelligence red flags.
 
 ### Payment Flow
 
@@ -41,6 +95,7 @@ Every agent action is metered and paid in USDC:
 
 | Action | Cost |
 |---|---|
+| JD Enhancement | $0.002 |
 | JD Parse | $0.002 |
 | Apollo Search | $0.001 |
 | Apollo Enrich | $0.003 |
@@ -49,8 +104,9 @@ Every agent action is metered and paid in USDC:
 | Hunter Find | $0.002 |
 | Hunter Verify | $0.001 |
 | Score Candidate | $0.003 |
+| Talent Intelligence | $0.005 |
 
-Typical full search (25 candidates) costs **$0.25–$0.35 USDC** — vs $500–$2000 for a human recruiter.
+Typical full search (25 candidates) costs **$0.30–$0.40 USDC** — vs $500–$2000 for a human recruiter.
 
 ### Smart Contracts (Vyper on Arc)
 
@@ -63,7 +119,7 @@ Typical full search (25 candidates) costs **$0.25–$0.35 USDC** — vs $500–$
 ### Tech Stack
 
 - **Backend:** FastAPI + LangGraph + Python 3.12
-- **LLMs:** Kimi K2.5 via NVIDIA NIM + Claude Sonnet 4.5 (Anthropic)
+- **LLMs:** Kimi K2.5 via NVIDIA NIM + Claude Sonnet 4.6 (Anthropic)
 - **Blockchain:** Vyper contracts + web3.py + EIP-3009 signed payments
 - **Payments:** Circle Nanopayments + x402 payment wall middleware
 - **Data APIs:** Apollo.io + GitHub REST API + Hunter.io
@@ -82,11 +138,13 @@ HireFlow/
 │
 ├── agents/
 │   ├── base.py                # Kimi K2.5 agent factory
+│   ├── jd_enhancement_agent.py  # JD expansion before parsing  ← NEW
 │   ├── jd_parser.py           # JD → ParsedJD
-│   ├── apollo_agent.py        # Apollo search + enrichment
+│   ├── apollo_agent.py        # Apollo search + enrichment + retry
 │   ├── github_agent.py        # GitHub profile + scoring
 │   ├── hunter_agent.py        # Email find + verify
-│   ├── scoring_agent.py       # Claude Sonnet 4.5 scoring
+│   ├── scoring_agent.py       # Claude Sonnet 4.6 structured scoring
+│   ├── talent_intelligence_agent.py  # Post-scoring insights  ← NEW
 │   └── orchestrator.py        # LangGraph state machine
 │
 ├── contracts/
@@ -103,21 +161,22 @@ HireFlow/
 │   └── arc_explorer.py        # Arc Block Explorer links
 │
 ├── services/
-│   ├── apollo.py              # Apollo.io REST client
-│   ├── github.py              # GitHub API client
+│   ├── apollo.py              # Apollo.io REST client + employment analysis
+│   ├── github.py              # GitHub API client + improved scoring
 │   ├── hunter.py              # Hunter.io API client
 │   ├── circle_wallets.py      # Circle Wallets API
 │   ├── circle_bridge.py       # Circle Bridge Kit
 │   └── circle_gateway.py      # Circle Gateway
 │
 ├── models/
-│   ├── job.py                 # ParsedJD
+│   ├── job.py                 # ParsedJD, EnhancedJD
 │   ├── candidate.py           # CandidateRaw/Enriched/Scored
+│   ├── intelligence.py        # TalentIntelligenceReport  ← NEW
 │   ├── payment.py             # PaymentEvent, EIP3009Authorization
 │   └── search.py              # SearchRequest/Status/Result
 │
 ├── routes/
-│   ├── search.py              # POST /api/search, GET results
+│   ├── search.py              # POST /api/search, GET results, GET intelligence
 │   ├── wallets.py             # Wallet balances + bridge
 │   └── payments.py            # Payment feed
 │
@@ -152,10 +211,10 @@ Fill in `.env` — see table below for where to get each key.
 ### 3. Generate agent wallet keys
 
 ```bash
-python -c "from eth_account import Account; [print(Account.create().key.hex()) for _ in range(6)]"
+python -c "from eth_account import Account; [print(Account.create().key.hex()) for _ in range(8)]"
 ```
 
-Assign the 6 printed keys to the `*_PRIVATE_KEY` variables in `.env`.
+Assign the 8 printed keys to the `*_PRIVATE_KEY` variables in `.env` (6 original + `JD_ENHANCEMENT_PRIVATE_KEY` + `TALENT_INTELLIGENCE_PRIVATE_KEY`).
 
 ### 4. Set up PostgreSQL
 
@@ -222,7 +281,15 @@ GET /api/search/{search_id}/status
 GET /api/search/{search_id}/results
 ```
 
-Returns ranked candidates with composite scores, justifications, emails, and GitHub data.
+Returns ranked candidates with composite scores, skill match detail, skill gaps, justifications, emails, and GitHub data.
+
+### Get Intelligence Report
+
+```http
+GET /api/search/{search_id}/intelligence
+```
+
+Returns the `TalentIntelligenceReport` for the search — top-3 summary, red flags, search quality score, and interview questions for each of the top 5 candidates.
 
 ### Live Payment Feed (WebSocket)
 
@@ -239,18 +306,6 @@ GET /api/payments/{search_id}/summary
 ```
 
 Returns cost breakdown by action type with Arc Block Explorer links.
-
----
-
-## Candidate Scoring Formula
-
-```
-composite_score =
-    skill_match_pct  × 0.40   (Claude extracts matched skills)
-  + github_score     × 0.30   (stars + languages + activity)
-  + seniority_fit    × 0.20   (under=5, over=10, match=20)
-  + email_validity   × 0.10   (verified=10, unverified=5, missing=0)
-```
 
 ---
 

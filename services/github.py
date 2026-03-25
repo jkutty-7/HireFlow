@@ -9,6 +9,7 @@ Endpoints used:
   GET /users/{username}/events/public     — last 30 events for activity score
 """
 
+import math
 import httpx
 from datetime import datetime, timezone, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -21,6 +22,26 @@ from models.candidate import GitHubProfile, GitHubRepo
 MAX_STARS_SCORE = 50      # max points for repo stars
 MAX_LANGUAGE_SCORE = 30   # max points for language match
 MAX_ACTIVITY_SCORE = 20   # max points for recent activity
+
+# Language alias normalisation: map common abbreviations to canonical names
+LANGUAGE_ALIASES: dict[str, str] = {
+    "js": "javascript",
+    "ts": "typescript",
+    "py": "python",
+    "rb": "ruby",
+    "kt": "kotlin",
+    "golang": "go",
+    "c#": "csharp",
+    "c++": "cplusplus",
+}
+
+# Event weights: quality-focused (PRs + Issues > raw pushes)
+EVENT_WEIGHTS: dict[str, int] = {
+    "PullRequestEvent": 3,
+    "IssuesEvent": 2,
+    "CreateEvent": 2,
+    "PushEvent": 1,
+}
 
 
 class GitHubClient:
@@ -130,26 +151,33 @@ class GitHubClient:
             except Exception:
                 pass
 
-        # Stars score
+        # Stars score: logarithmic scale rewards any public presence fairly
+        # 1 star→~8pts | 10→~17pts | 100→~33pts | 1000+→50pts
         total_stars = sum(r.stars for r in repos)
-        stars_score = min(total_stars / 10, MAX_STARS_SCORE)
+        stars_score = min(math.log1p(total_stars) / math.log1p(1000) * MAX_STARS_SCORE, MAX_STARS_SCORE)
 
-        # Language match score
-        required_lower = {l.lower() for l in required_languages}
-        matched = sum(1 for l in all_languages if l.lower() in required_lower)
+        # Language match score with alias normalisation
+        def _normalise(lang: str) -> str:
+            key = lang.lower()
+            return LANGUAGE_ALIASES.get(key, key)
+
+        required_normalised = {_normalise(l) for l in required_languages}
+        matched = sum(1 for l in all_languages if _normalise(l) in required_normalised)
         lang_score = (matched / max(len(required_languages), 1)) * MAX_LANGUAGE_SCORE
 
-        # Activity score (events in last 30 days)
+        # Activity score: quality-weighted (PRs and issues count more than raw pushes)
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-        scored_event_types = {"PushEvent", "PullRequestEvent", "IssuesEvent", "CreateEvent"}
+        weighted_activity = sum(
+            EVENT_WEIGHTS.get(e.get("type", ""), 0)
+            for e in events
+            if datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) > cutoff
+        )
+        activity_score = min(weighted_activity * 1.5, MAX_ACTIVITY_SCORE)
         recent_count = sum(
             1 for e in events
-            if e.get("type") in scored_event_types
-            and datetime.fromisoformat(
-                e["created_at"].replace("Z", "+00:00")
-            ) > cutoff
+            if e.get("type") in EVENT_WEIGHTS
+            and datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) > cutoff
         )
-        activity_score = min(recent_count * 2, MAX_ACTIVITY_SCORE)
 
         github_score = round(stars_score + lang_score + activity_score, 2)
 

@@ -31,16 +31,12 @@ async def find_email_for_candidate(
         log.debug("email_already_found", candidate=candidate.name, email=candidate.email)
         return candidate
 
-    # Get company domain
-    company = candidate.company or ""
-    if not company:
-        return candidate
-
-    domain = HunterClient.extract_domain_from_company(
-        company, candidate.linkedin_url
+    # Get company domain — prefer Apollo's org domain over naive slug extraction
+    domain = candidate.organization_domain or HunterClient.extract_domain_from_company(
+        candidate.company or "", candidate.linkedin_url
     )
     if not domain:
-        log.debug("hunter_no_domain", candidate=candidate.name, company=company)
+        log.debug("hunter_no_domain", candidate=candidate.name, company=candidate.company)
         return candidate
 
     # Parse first/last name

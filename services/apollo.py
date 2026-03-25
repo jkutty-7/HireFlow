@@ -128,6 +128,10 @@ class ApolloClient:
         if not github_url:
             github_url = person.get("github_url")
 
+        # Extract actual company domain from Apollo org data (Bug 4 fix)
+        org = person.get("organization") or {}
+        organization_domain = org.get("primary_domain") or org.get("website_url") or None
+
         skills = [s.get("name", "") for s in person.get("skills", []) if s.get("name")]
         employment = [
             {
@@ -138,6 +142,9 @@ class ApolloClient:
             }
             for exp in person.get("employment_history", [])
         ]
+
+        # Derive LinkedIn tenure/trajectory signals from employment history
+        tenure_signals = self._analyze_employment(employment)
 
         return CandidateEnriched(
             apollo_id=person.get("id"),
@@ -153,4 +160,73 @@ class ApolloClient:
             skills=skills,
             employment_history=employment,
             github_username=None,
+            organization_domain=organization_domain,
+            avg_tenure_months=tenure_signals["avg_tenure_months"],
+            is_job_hopper=tenure_signals["is_job_hopper"],
+            career_trajectory=tenure_signals["career_trajectory"],
         )
+
+    @staticmethod
+    def _analyze_employment(history: list[dict]) -> dict:
+        """Derive tenure and career trajectory signals from employment history."""
+        from datetime import datetime
+
+        if not history:
+            return {"avg_tenure_months": None, "is_job_hopper": False, "career_trajectory": "unknown"}
+
+        tenures = []
+        for job in history:
+            start_str = job.get("start")
+            end_str = job.get("end")
+            if not start_str:
+                continue
+            try:
+                # Apollo dates can be "YYYY-MM-DD" or "YYYY-MM" or "YYYY"
+                def _parse_date(s: str) -> datetime:
+                    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+                        try:
+                            return datetime.strptime(s, fmt)
+                        except ValueError:
+                            continue
+                    raise ValueError(f"Unknown date format: {s}")
+
+                start = _parse_date(start_str)
+                end = _parse_date(end_str) if end_str and end_str.lower() != "present" else datetime.now()
+                months = (end.year - start.year) * 12 + (end.month - start.month)
+                if months > 0:
+                    tenures.append(months)
+            except Exception:
+                continue
+
+        if not tenures:
+            return {"avg_tenure_months": None, "is_job_hopper": False, "career_trajectory": "unknown"}
+
+        avg = round(sum(tenures) / len(tenures), 1)
+        is_job_hopper = avg < 12 and len(history) >= 3
+
+        # Infer trajectory: look for seniority keywords in titles over time
+        seniority_keywords = {
+            "staff": 5, "principal": 5, "distinguished": 5,
+            "lead": 4, "architect": 4,
+            "senior": 3, "sr": 3,
+            "mid": 2, "ii": 2, "2": 2,
+            "junior": 1, "jr": 1, "associate": 1,
+        }
+        titles_with_level = []
+        for job in history:
+            title = (job.get("title") or "").lower()
+            for kw, level in seniority_keywords.items():
+                if kw in title.split():
+                    titles_with_level.append(level)
+                    break
+
+        trajectory = "unknown"
+        if len(titles_with_level) >= 2:
+            if titles_with_level[0] > titles_with_level[-1]:
+                trajectory = "ascending"
+            elif titles_with_level[0] == titles_with_level[-1]:
+                trajectory = "lateral"
+            else:
+                trajectory = "descending"
+
+        return {"avg_tenure_months": avg, "is_job_hopper": is_job_hopper, "career_trajectory": trajectory}

@@ -8,6 +8,7 @@ Payment: $0.002 USDC per parse via Circle Nanopayments.
 """
 
 import json
+import re
 import structlog
 
 from langchain_core.tools import tool
@@ -15,6 +16,13 @@ from agents.base import create_kimi_agent
 from models.job import ParsedJD
 
 log = structlog.get_logger()
+
+VALID_SENIORITIES = {"junior", "mid", "senior", "lead", "staff"}
+
+
+class JDParseError(Exception):
+    """Raised when the LLM returns a response that cannot be parsed into a ParsedJD."""
+    pass
 
 JD_PARSER_SYSTEM_PROMPT = """
 You are a technical recruiter assistant that extracts structured hiring criteria
@@ -62,19 +70,31 @@ async def parse_job_description(raw_jd: str) -> ParsedJD:
 
     try:
         data = json.loads(content)
+    except json.JSONDecodeError:
+        # Attempt to recover JSON embedded in prose or markdown fences
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                data = None
+        else:
+            data = None
+
+    if data is None:
+        log.error("jd_parse_failed_unrecoverable", raw_response=content[:300])
+        raise JDParseError(f"Could not extract valid JSON from JD parser response: {content[:300]}")
+
+    try:
+        # Normalise seniority to a valid value
+        seniority = str(data.get("seniority", "senior")).lower()
+        if seniority not in VALID_SENIORITIES:
+            seniority = "senior"
+        data["seniority"] = seniority
+
         parsed = ParsedJD(**data, raw_jd=raw_jd)
         log.info("jd_parsed", skills=parsed.skills, seniority=parsed.seniority)
         return parsed
-    except (json.JSONDecodeError, Exception) as exc:
-        log.error("jd_parse_failed", error=str(exc), raw_response=content[:200])
-        # Return a minimal default so the pipeline doesn't crash
-        return ParsedJD(
-            skills=[],
-            seniority="senior",
-            location="Remote",
-            years_exp=5,
-            titles=["Software Engineer"],
-            languages=[],
-            keywords=[],
-            raw_jd=raw_jd,
-        )
+    except Exception as exc:
+        log.error("jd_parse_model_failed", error=str(exc), data=str(data)[:200])
+        raise JDParseError(f"ParsedJD construction failed: {exc}") from exc

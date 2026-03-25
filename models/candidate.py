@@ -47,10 +47,16 @@ class CandidateEnriched(CandidateRaw):
     employment_history: list[dict] = Field(default_factory=list)
     github_username: Optional[str] = None
     github_data: Optional[GitHubProfile] = None
+    # Apollo org domain (used by Hunter for email discovery)
+    organization_domain: Optional[str] = None
+    # Employment signals derived from employment_history
+    avg_tenure_months: Optional[float] = None
+    is_job_hopper: bool = False
+    career_trajectory: str = "unknown"  # ascending | lateral | descending | unknown
 
 
 class CandidateScored(CandidateEnriched):
-    """After AI scoring agent (Claude Sonnet 4.5)."""
+    """After AI scoring agent (Claude Sonnet 4.6)."""
     skill_match_pct: float = 0.0
     seniority_fit: str = "unknown"   # under | match | over | unknown
     github_score: float = 0.0
@@ -59,3 +65,6 @@ class CandidateScored(CandidateEnriched):
     rank_justification: str = ""
     rank: Optional[int] = None
     candidate_id: Optional[uuid.UUID] = None
+    # Structured skill match output from semantic matching
+    skill_match_detail: list[dict] = Field(default_factory=list)
+    skill_gaps: list[str] = Field(default_factory=list)

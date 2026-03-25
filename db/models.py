@@ -34,6 +34,7 @@ class Search(Base):
     escrow_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
     refund_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
     recruiter_wallet_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    intelligence_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -82,6 +83,8 @@ class Candidate(Base):
     composite_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     rank_justification: Mapped[str | None] = mapped_column(Text, nullable=True)
     rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    skill_match_detail: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    skill_gaps: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

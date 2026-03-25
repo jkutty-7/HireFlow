@@ -215,3 +215,32 @@ def _map_email_validity(status: str | None, confidence: int | None) -> str:
     if status and status != "unknown":
         return "unverified"
     return "missing"
+
+
+@router.get("/{search_id}/intelligence")
+async def get_intelligence_report(
+    search_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the Talent Intelligence Report for a completed search.
+    Includes top-3 summary, red flags, interview questions per candidate, and search quality score.
+    """
+    try:
+        search_uuid = uuid.UUID(search_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid search_id format")
+
+    result = await db.execute(select(Search).where(Search.id == search_uuid))
+    search = result.scalar_one_or_none()
+
+    if not search:
+        raise HTTPException(status_code=404, detail="Search not found")
+
+    if search.status != "complete":
+        raise HTTPException(status_code=202, detail=f"Search is {search.status} — intelligence report not yet available")
+
+    if not search.intelligence_report:
+        raise HTTPException(status_code=404, detail="Intelligence report not available for this search")
+
+    return search.intelligence_report

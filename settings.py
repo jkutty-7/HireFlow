@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     hunter_agent_wallet_id: str = Field(default="")
     scoring_agent_wallet_id: str = Field(default="")
     jd_parser_wallet_id: str = Field(default="")
+    jd_enhancement_wallet_id: str = Field(default="")
+    talent_intelligence_wallet_id: str = Field(default="")
 
     # ─── Wallet Private Keys (EIP-3009 signing) ──────────────
     orchestrator_private_key: str = Field(default="0x")
@@ -48,6 +50,8 @@ class Settings(BaseSettings):
     hunter_private_key: str = Field(default="0x")
     scoring_private_key: str = Field(default="0x")
     jd_parser_private_key: str = Field(default="0x")
+    jd_enhancement_private_key: str = Field(default="0x")
+    talent_intelligence_private_key: str = Field(default="0x")
 
     # ─── Database ────────────────────────────────────────────
     database_url: str = Field(
@@ -98,6 +102,8 @@ class Settings(BaseSettings):
         "/hunter/verify": 0.001,
         "/score/candidate": 0.003,
         "/jd/parse": 0.002,
+        "/jd/enhance": 0.002,
+        "/talent/intelligence": 0.005,
     }
 
 
