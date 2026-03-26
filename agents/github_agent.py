@@ -38,6 +38,10 @@ async def enrich_with_github(
     Fetch GitHub data for a single candidate and attach it to their profile.
     Returns the candidate with github_data and github_username populated.
     """
+    # Skip candidates already enriched by the GitHub Source Agent
+    if candidate.github_data is not None:
+        return candidate
+
     # Try to get username from GitHub URL
     username = candidate.github_username or _extract_username_from_url(candidate.github_url)
 

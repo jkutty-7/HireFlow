@@ -36,6 +36,8 @@ class CandidateRaw(BaseModel):
     linkedin_url: Optional[str] = None
     location: Optional[str] = None
     github_url: Optional[str] = None
+    # "apollo" | "github_repo" — tracks where this candidate was discovered
+    source: str = "apollo"
 
 
 class CandidateEnriched(CandidateRaw):
@@ -53,6 +55,8 @@ class CandidateEnriched(CandidateRaw):
     avg_tenure_months: Optional[float] = None
     is_job_hopper: bool = False
     career_trajectory: str = "unknown"  # ascending | lateral | descending | unknown
+    # Repos this candidate was discovered through (github_repo source only)
+    source_repos: list[str] = Field(default_factory=list)
 
 
 class CandidateScored(CandidateEnriched):

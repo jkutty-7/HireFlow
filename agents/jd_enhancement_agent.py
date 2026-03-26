@@ -13,6 +13,7 @@ What it does:
 Payment: $0.002 USDC per enhancement via Circle Nanopayments.
 """
 
+import asyncio
 import json
 import re
 import structlog
@@ -63,8 +64,9 @@ async def enhance_job_description(raw_jd: str) -> EnhancedJD:
     agent = create_kimi_agent(tools=[], system_prompt=JD_ENHANCEMENT_SYSTEM_PROMPT, timeout=30)
 
     try:
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": raw_jd}]}
+        result = await asyncio.wait_for(
+            agent.ainvoke({"messages": [{"role": "user", "content": raw_jd}]}),
+            timeout=30.0,
         )
         last_message = result["messages"][-1]
         content = last_message.content if hasattr(last_message, "content") else str(last_message)

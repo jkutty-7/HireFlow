@@ -77,6 +77,10 @@ class Candidate(Base):
     github_repos: Mapped[list | None] = mapped_column(JSON, nullable=True)
     github_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Discovery source
+    source: Mapped[str] = mapped_column(String(32), default="apollo")  # apollo | github_repo
+    source_repos: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
     # AI Scoring (Claude)
     skill_match_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     seniority_fit: Mapped[str | None] = mapped_column(String(16), nullable=True)

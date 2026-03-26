@@ -123,6 +123,49 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
+    async def search_repos(self, query: str, max_repos: int = 5) -> list[dict]:
+        """Search GitHub repositories by tech-stack query, sorted by stars."""
+        resp = await self._client.get(
+            "/search/repositories",
+            params={"q": query, "sort": "stars", "order": "desc", "per_page": max_repos},
+        )
+        resp.raise_for_status()
+        return [
+            {
+                "full_name": r["full_name"],
+                "owner": r["owner"]["login"],
+                "name": r["name"],
+                "description": r.get("description"),
+                "stars": r.get("stargazers_count", 0),
+                "language": r.get("language"),
+                "topics": r.get("topics", []),
+            }
+            for r in resp.json().get("items", [])
+        ]
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
+    async def get_repo_contributors(
+        self, owner: str, repo: str, max_contributors: int = 10
+    ) -> list[dict]:
+        """Return top contributors (humans only) for a repository."""
+        resp = await self._client.get(
+            f"/repos/{owner}/{repo}/contributors",
+            params={"per_page": max_contributors, "anon": "false"},
+        )
+        if resp.status_code == 204:
+            return []
+        resp.raise_for_status()
+        return [
+            {
+                "login": c["login"],
+                "contributions": c.get("contributions", 0),
+                "html_url": c.get("html_url", ""),
+            }
+            for c in resp.json()
+            if c.get("type") == "User"  # skip bot accounts
+        ]
+
     async def build_github_profile(
         self,
         username: str,

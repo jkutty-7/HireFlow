@@ -37,6 +37,7 @@ from agents.jd_enhancement_agent import enhance_job_description
 from agents.jd_parser import parse_job_description, JDParseError
 from agents.apollo_agent import run_apollo_agent
 from agents.github_agent import run_github_agent
+from agents.github_source_agent import run_github_source_agent
 from agents.hunter_agent import run_hunter_agent
 from agents.scoring_agent import run_scoring_agent
 from agents.talent_intelligence_agent import run_talent_intelligence_agent
@@ -324,66 +325,129 @@ class HireFlowOrchestrator:
         log.info("stage_collect_data", search_id=state["search_id"])
         parsed_jd = ParsedJD(**state["parsed_jd"])
 
-        # ── Step 1: Apollo (must run first — GitHub & Hunter consume its output) ──
-        apollo_candidates = await run_apollo_agent(parsed_jd)
+        # ── Step 1: Apollo + GitHub Repo Source in TRUE parallel ───────────────
+        apollo_result, github_source_result = await asyncio.gather(
+            run_apollo_agent(parsed_jd),
+            run_github_source_agent(parsed_jd),
+            return_exceptions=True,
+        )
 
-        if not apollo_candidates:
-            log.warning("apollo_empty_results", search_id=state["search_id"])
+        apollo_candidates: list[CandidateEnriched] = (
+            apollo_result if not isinstance(apollo_result, Exception) else []
+        )
+        github_source_candidates: list[CandidateEnriched] = (
+            github_source_result if not isinstance(github_source_result, Exception) else []
+        )
+
+        if isinstance(apollo_result, Exception):
+            log.error("apollo_agent_failed", error=str(apollo_result))
+        if isinstance(github_source_result, Exception):
+            log.warning("github_source_agent_failed", error=str(github_source_result))
+
+        # ── Step 2: Merge Apollo + GitHub Source, deduplicate by github_username ─
+        existing_github_usernames = {
+            c.github_username for c in apollo_candidates if c.github_username
+        }
+        new_from_repos = [
+            c for c in github_source_candidates
+            if c.github_username not in existing_github_usernames
+        ]
+        all_candidates = apollo_candidates + new_from_repos
+
+        log.info(
+            "collect_data_merged",
+            apollo=len(apollo_candidates),
+            github_source=len(github_source_candidates),
+            new_unique_from_repos=len(new_from_repos),
+            total=len(all_candidates),
+        )
+
+        if not all_candidates:
+            log.warning("collect_data_empty_results", search_id=state["search_id"])
             return {
                 "candidates_enriched": [],
                 "total_spent_usdc": state["total_spent_usdc"],
                 "stage": "score_candidates",
             }
 
-        # ── Step 2: GitHub + Hunter in TRUE parallel ───────────────────────────
+        # ── Step 3: GitHub enrichment + Hunter in TRUE parallel ────────────────
+        # run_github_agent skips candidates that already have github_data (repo-sourced)
         github_results, hunter_results = await asyncio.gather(
-            run_github_agent(apollo_candidates, parsed_jd),
-            run_hunter_agent(apollo_candidates),
+            run_github_agent(all_candidates, parsed_jd),
+            run_hunter_agent(all_candidates),
             return_exceptions=True,
         )
 
-        # Handle partial failures gracefully
         if isinstance(github_results, Exception):
             log.error("github_agent_failed", error=str(github_results))
-            github_results = apollo_candidates
+            github_results = all_candidates
 
         if isinstance(hunter_results, Exception):
             log.error("hunter_agent_failed", error=str(hunter_results))
-            hunter_results = apollo_candidates
+            hunter_results = all_candidates
 
-        # ── Step 3: Merge GitHub and Hunter results by apollo_id ───────────────
-        hunter_by_id = {c.apollo_id: c for c in hunter_results if c.apollo_id}
+        # ── Step 4: Merge GitHub and Hunter results ────────────────────────────
+        # Apollo candidates: merge by apollo_id
+        # GitHub-source candidates: merge by github_username (no apollo_id)
+        hunter_by_apollo = {c.apollo_id: c for c in hunter_results if c.apollo_id}
+        hunter_by_github = {c.github_username: c for c in hunter_results if c.github_username and not c.apollo_id}
+
         merged: list[CandidateEnriched] = []
         for c in github_results:
-            if c.apollo_id and c.apollo_id in hunter_by_id:
-                h = hunter_by_id[c.apollo_id]
+            if c.apollo_id and c.apollo_id in hunter_by_apollo:
+                h = hunter_by_apollo[c.apollo_id]
+                c.email = h.email
+                c.email_confidence = h.email_confidence
+                c.email_status = h.email_status
+            elif c.github_username and c.github_username in hunter_by_github and not c.email:
+                h = hunter_by_github[c.github_username]
                 c.email = h.email
                 c.email_confidence = h.email_confidence
                 c.email_status = h.email_status
             merged.append(c)
 
-        # ── Step 4: Record payments (batch commit once) ────────────────────────
+        # ── Step 5: Record payments (batch commit once) ────────────────────────
         payment_records = []
         spent = state["total_spent_usdc"]
 
-        for candidate in merged:
-            # Apollo: always search + enrich
+        # GitHub Repo Source payments: search + per-repo scan
+        if not isinstance(github_source_result, Exception) and github_source_candidates:
             payment_records.append(dict(
-                action_type="apollo_search",
+                action_type="github_repo_search",
                 paying_agent="orchestrator",
-                receiving_agent="apollo_agent",
-                amount_usdc=settings.action_prices["/apollo/search"],
+                receiving_agent="github_source_agent",
+                amount_usdc=settings.action_prices["/github/repo_search"],
             ))
-            payment_records.append(dict(
-                action_type="apollo_enrich",
-                paying_agent="orchestrator",
-                receiving_agent="apollo_agent",
-                amount_usdc=settings.action_prices["/apollo/enrich"],
-            ))
-            spent += settings.action_prices["/apollo/search"] + settings.action_prices["/apollo/enrich"]
+            spent += settings.action_prices["/github/repo_search"]
 
-            # GitHub: only if data was fetched
-            if candidate.github_data:
+        for candidate in merged:
+            if candidate.source == "apollo":
+                # Apollo: search + enrich
+                payment_records.append(dict(
+                    action_type="apollo_search",
+                    paying_agent="orchestrator",
+                    receiving_agent="apollo_agent",
+                    amount_usdc=settings.action_prices["/apollo/search"],
+                ))
+                payment_records.append(dict(
+                    action_type="apollo_enrich",
+                    paying_agent="orchestrator",
+                    receiving_agent="apollo_agent",
+                    amount_usdc=settings.action_prices["/apollo/enrich"],
+                ))
+                spent += settings.action_prices["/apollo/search"] + settings.action_prices["/apollo/enrich"]
+            elif candidate.source == "github_repo":
+                # Repo scan fee per candidate sourced from GitHub
+                payment_records.append(dict(
+                    action_type="github_repo_scan",
+                    paying_agent="orchestrator",
+                    receiving_agent="github_source_agent",
+                    amount_usdc=settings.action_prices["/github/repo_scan"],
+                ))
+                spent += settings.action_prices["/github/repo_scan"]
+
+            # GitHub enrichment: only for Apollo candidates that got new data
+            if candidate.github_data and candidate.source == "apollo":
                 payment_records.append(dict(
                     action_type="github_profile",
                     paying_agent="orchestrator",
@@ -399,7 +463,7 @@ class HireFlowOrchestrator:
                 spent += settings.action_prices["/github/profile"] + settings.action_prices["/github/repos"]
 
             # Hunter: only if email was found
-            if candidate.email:
+            if candidate.email and candidate.email_confidence is not None:
                 payment_records.append(dict(
                     action_type="hunter_find",
                     paying_agent="orchestrator",
@@ -524,6 +588,8 @@ class HireFlowOrchestrator:
                 rank=c.get("rank") or rank,
                 skill_match_detail=c.get("skill_match_detail"),
                 skill_gaps=c.get("skill_gaps"),
+                source=c.get("source", "apollo"),
+                source_repos=c.get("source_repos") or None,
             )
             self._db.add(orm_candidate)
 

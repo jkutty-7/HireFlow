@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     jd_parser_wallet_id: str = Field(default="")
     jd_enhancement_wallet_id: str = Field(default="")
     talent_intelligence_wallet_id: str = Field(default="")
+    github_source_agent_wallet_id: str = Field(default="")
 
     # ─── Wallet Private Keys (EIP-3009 signing) ──────────────
     orchestrator_private_key: str = Field(default="0x")
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     jd_parser_private_key: str = Field(default="0x")
     jd_enhancement_private_key: str = Field(default="0x")
     talent_intelligence_private_key: str = Field(default="0x")
+    github_source_private_key: str = Field(default="0x")
 
     # ─── Database ────────────────────────────────────────────
     database_url: str = Field(
@@ -104,6 +106,8 @@ class Settings(BaseSettings):
         "/jd/parse": 0.002,
         "/jd/enhance": 0.002,
         "/talent/intelligence": 0.005,
+        "/github/repo_search": 0.001,
+        "/github/repo_scan": 0.001,
     }
 
 

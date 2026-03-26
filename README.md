@@ -11,15 +11,18 @@ HireFlow replaces a full recruitment team with a swarm of specialized AI agents.
 ```
 Recruiter → POST /api/search
                ↓
-         JD Enhancement Agent (Kimi K2.5)    ← NEW: expands brief JDs
+         JD Enhancement Agent (Kimi K2.5)      ← expands brief JDs
                ↓
          JD Parser Agent (Kimi K2.5)
                ↓
-         Apollo Agent  →  GitHub Agent + Hunter Agent  (true parallel)
+         Apollo Agent ─────────────────────────┐  (true parallel)
+         GitHub Repo Source Agent  ← NEW       │
+               ↓  (deduplicate + merge)         │
+         GitHub Agent + Hunter Agent ───────────┘  (true parallel)
                ↓
-         Scoring Agent (Claude Sonnet 4.6)   ← semantic skill matching
+         Scoring Agent (Claude Sonnet 4.6)      ← semantic skill matching
                ↓
-         Talent Intelligence Agent (Claude Sonnet 4.6)  ← NEW: insights + interview questions
+         Talent Intelligence Agent (Claude Sonnet 4.6)  ← insights + interview questions
                ↓
          Ranked candidates + intelligence report + payment feed over WebSocket
 ```
@@ -35,8 +38,9 @@ Recruiter → POST /api/search
 | JD Enhancement | Kimi K2.5 (NVIDIA NIM) | Expands abbreviated JDs, adds implied skills and search titles |
 | JD Parser | Kimi K2.5 (NVIDIA NIM) | Extracts skills, seniority, titles from free-text JD |
 | Apollo Agent | Kimi K2.5 | Searches + enriches candidates via Apollo.io; retries with relaxed params on thin results |
-| GitHub Agent | Kimi K2.5 | Fetches repos, languages, activity score (0-100) |
-| Hunter Agent | Kimi K2.5 | Finds + verifies professional emails using real company domains |
+| GitHub Repo Source | GitHub REST API | Finds relevant open-source repos by tech stack, mines contributors as candidates |
+| GitHub Agent | GitHub REST API | Fetches profile, repos, languages, activity score (0-100) for known candidates |
+| Hunter Agent | Hunter.io API | Finds + verifies professional emails using real company domains |
 | Scoring Agent | Claude Sonnet 4.6 | Structured per-skill semantic matching + deterministic composite scoring |
 | Talent Intelligence | Claude Sonnet 4.6 | Post-pool analysis: top-3 summary, red flags, interview questions per candidate |
 | Orchestrator | LangGraph | State machine coordinating all agents |
@@ -99,6 +103,8 @@ Every agent action is metered and paid in USDC:
 | JD Parse | $0.002 |
 | Apollo Search | $0.001 |
 | Apollo Enrich | $0.003 |
+| GitHub Repo Search | $0.001 |
+| GitHub Repo Scan (per repo) | $0.001 |
 | GitHub Profile | $0.001 |
 | GitHub Repos | $0.001 |
 | Hunter Find | $0.002 |
@@ -141,6 +147,7 @@ HireFlow/
 │   ├── jd_enhancement_agent.py  # JD expansion before parsing  ← NEW
 │   ├── jd_parser.py           # JD → ParsedJD
 │   ├── apollo_agent.py        # Apollo search + enrichment + retry
+│   ├── github_source_agent.py # Repo discovery → contributor sourcing  ← NEW
 │   ├── github_agent.py        # GitHub profile + scoring
 │   ├── hunter_agent.py        # Email find + verify
 │   ├── scoring_agent.py       # Claude Sonnet 4.6 structured scoring

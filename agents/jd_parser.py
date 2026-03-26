@@ -7,6 +7,7 @@ Output: ParsedJD (structured JSON with skills, seniority, location, etc.)
 Payment: $0.002 USDC per parse via Circle Nanopayments.
 """
 
+import asyncio
 import json
 import re
 import structlog
@@ -60,9 +61,17 @@ async def parse_job_description(raw_jd: str) -> ParsedJD:
     """
     agent = create_kimi_agent(tools=[], system_prompt=JD_PARSER_SYSTEM_PROMPT)
 
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": raw_jd}]}
-    )
+    try:
+        result = await asyncio.wait_for(
+            agent.ainvoke({"messages": [{"role": "user", "content": raw_jd}]}),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        log.error("jd_parse_timeout")
+        raise JDParseError("JD parser timed out after 45 seconds — NVIDIA NIM unavailable")
+    except Exception as exc:
+        log.error("jd_parse_agent_error", error=str(exc)[:200])
+        raise JDParseError(f"JD parser agent error: {exc}") from exc
 
     # Extract the last message content
     last_message = result["messages"][-1]
