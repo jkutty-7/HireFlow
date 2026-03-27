@@ -12,6 +12,7 @@ import structlog
 from web3 import Web3
 
 from settings import settings
+from services.cache import cache_get, cache_set, make_key, AGENT_VERIFY_TTL
 
 log = structlog.get_logger()
 
@@ -66,13 +67,23 @@ class AgentVerifier:
         """
         Returns True if the agent is registered and active in AgentRegistry.vy.
         Falls back to True if registry contract is not yet deployed (dev mode).
+        Result is cached for AGENT_VERIFY_TTL seconds to avoid a blockchain call
+        on every pipeline run.
         """
         if not self._ready():
             log.warning("agent_registry_not_deployed", note="skipping verification — dev mode")
             return True
+
+        cache_key = make_key("agent_verified", agent_address)
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             checksum_addr = Web3.to_checksum_address(agent_address)
-            return self._contract.functions.is_verified(checksum_addr).call()
+            result = self._contract.functions.is_verified(checksum_addr).call()
+            cache_set(cache_key, result, AGENT_VERIFY_TTL)
+            return result
         except Exception as exc:
             log.error("agent_verification_failed", address=agent_address, error=str(exc))
             return False

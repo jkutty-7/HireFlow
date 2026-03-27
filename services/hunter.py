@@ -16,6 +16,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from settings import settings
+from services.cache import cache_get, cache_set, make_key, HUNTER_DOMAIN_TTL
 
 
 class HunterClient:
@@ -29,12 +30,24 @@ class HunterClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     async def domain_search(self, domain: str, limit: int = 5) -> dict:
         """
         Returns known emails and the pattern for a company domain.
         One credit covers up to 10 emails.
+
+        Results are cached for HUNTER_DOMAIN_TTL seconds — if 10 candidates share
+        the same company domain, only 1 API credit is consumed.
         """
+        cache_key = make_key("hunter_domain", domain)
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+        result = await self._domain_search_api(domain, limit)
+        cache_set(cache_key, result, HUNTER_DOMAIN_TTL)
+        return result
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
+    async def _domain_search_api(self, domain: str, limit: int = 5) -> dict:
         resp = await self._client.get(
             "/v2/domain-search",
             params={"domain": domain, "limit": limit, "api_key": self._api_key},

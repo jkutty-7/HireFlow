@@ -43,6 +43,7 @@ SENIORITY_SCORE: dict[str, float] = {
 EMAIL_SCORE: dict[str, float] = {
     "verified":   10.0,
     "unverified":  5.0,
+    "risky":       2.5,
     "missing":     0.0,
 }
 
@@ -152,7 +153,7 @@ The skill_match_pct has already been computed — do NOT recalculate it.
 Respond with ONLY a JSON object containing exactly these fields:
 {
   "seniority_fit": "<under | match | over>",
-  "email_validity": "<verified | unverified | missing>",
+  "email_validity": "<verified | unverified | risky | missing>",
   "rank_justification": "<4-5 sentence assessment>"
 }
 
@@ -191,6 +192,8 @@ def _build_candidate_prompt(
     if candidate.email:
         if candidate.email_status == "valid" and (candidate.email_confidence or 0) >= 80:
             email_validity = "verified"
+        elif candidate.email_status == "risky":
+            email_validity = "risky"
         else:
             email_validity = "unverified"
 
@@ -247,8 +250,22 @@ async def score_candidate(
         HumanMessage(content=prompt),
     ]
 
-    response = await llm.ainvoke(messages)
-    content = response.content
+    try:
+        response = await llm.ainvoke(messages)
+        content = response.content
+    except Exception as exc:
+        # Call 2 failed — preserve Call 1 results with partial score
+        log.warning("scoring_justification_failed", candidate=candidate.name, error=str(exc)[:150])
+        github_score = float(candidate.github_data.github_score if candidate.github_data else 0)
+        return CandidateScored(
+            **candidate.model_dump(),
+            skill_match_pct=skill_match_pct,
+            skill_match_detail=skill_match_detail,
+            skill_gaps=skill_gaps,
+            github_score=github_score,
+            composite_score=round(skill_match_pct * 0.40 + github_score * 0.30, 2),
+            rank_justification=f"Partial score — justification unavailable: {exc}",
+        )
 
     try:
         score_data = json.loads(content)
@@ -324,7 +341,13 @@ async def run_scoring_agent(
         max_tokens=1024,
     )
 
-    tasks = [score_candidate(c, parsed_jd, llm) for c in candidates]
+    semaphore = asyncio.Semaphore(3)
+
+    async def _score_one(c: CandidateEnriched) -> CandidateScored:
+        async with semaphore:
+            return await score_candidate(c, parsed_jd, llm)
+
+    tasks = [_score_one(c) for c in candidates]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     scored_candidates = []
@@ -341,7 +364,10 @@ async def run_scoring_agent(
         else:
             scored_candidates.append(result)
 
-    scored_candidates.sort(key=lambda c: c.composite_score, reverse=True)
+    scored_candidates.sort(
+        key=lambda c: (c.composite_score, c.github_score, c.skill_match_pct),
+        reverse=True,
+    )
     for i, candidate in enumerate(scored_candidates):
         candidate.rank = i + 1
 

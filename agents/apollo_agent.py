@@ -1,5 +1,5 @@
 """
-Apollo Agent — Kimi K2.5 via ChatNVIDIA.
+Apollo Agent — Apollo.io REST API.
 
 Responsibilities:
   - Search Apollo.io for candidates matching the parsed JD
@@ -11,8 +11,6 @@ Payment wall: $0.001 per search, $0.003 per enrichment (x402 on each call)
 import asyncio
 import structlog
 
-from langchain_core.tools import tool
-from agents.base import create_kimi_agent
 from services.apollo import ApolloClient
 from models.candidate import CandidateRaw, CandidateEnriched
 from models.job import ParsedJD

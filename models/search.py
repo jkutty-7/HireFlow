@@ -13,6 +13,14 @@ class SearchRequest(BaseModel):
         None, description="Circle Wallet ID of the recruiter funding the search"
     )
     max_candidates: int = Field(default=25, ge=5, le=50)
+    location_filter: Optional[str] = Field(
+        None,
+        description=(
+            "Restrict candidates to a specific city/region. "
+            "Overrides any location parsed from the JD. "
+            "Examples: 'Bangalore', 'Kerala', 'Mumbai', 'Remote'."
+        ),
+    )
 
 
 class SearchStatus(BaseModel):

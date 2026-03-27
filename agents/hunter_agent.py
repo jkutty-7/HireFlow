@@ -1,5 +1,5 @@
 """
-Hunter Agent — Kimi K2.5 via ChatNVIDIA.
+Hunter Agent — Hunter.io REST API.
 
 Responsibilities:
   - For each candidate, discover and verify their professional email

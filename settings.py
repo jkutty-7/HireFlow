@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     )
 
     # ─── LLM Providers ───────────────────────────────────────
-    nvidia_api_key: str = Field(..., description="NVIDIA NIM API key for Kimi K2.5")
-    anthropic_api_key: str = Field(..., description="Anthropic API key for Claude Sonnet 4.5")
+    nvidia_api_key: str = Field(default="", description="NVIDIA NIM API key (unused — kept for .env compatibility)")
+    anthropic_api_key: str = Field(..., description="Anthropic API key for Claude Sonnet 4.6")
 
     # ─── Candidate Data APIs ─────────────────────────────────
     apollo_api_key: str = Field(..., description="Apollo.io master API key")
@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     environment: str = Field(default="testnet")
     log_level: str = Field(default="INFO")
     secret_key: str = Field(default="change-me-to-a-random-32-char-string")
+    cors_origins: list[str] = Field(
+        default=["http://localhost:3000", "http://localhost:3001"],
+        description="Allowed CORS origins — override in production",
+    )
 
     # ─── Derived / Computed ───────────────────────────────────
     @property

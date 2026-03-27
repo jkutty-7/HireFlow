@@ -20,7 +20,6 @@ Phase 2 fixes:
 """
 
 import asyncio
-import json
 import uuid
 import structlog
 
@@ -32,7 +31,6 @@ from web3 import Web3
 from settings import settings
 from models.job import ParsedJD
 from models.candidate import CandidateEnriched, CandidateScored
-from models.payment import PaymentEvent
 from agents.jd_enhancement_agent import enhance_job_description
 from agents.jd_parser import parse_job_description, JDParseError
 from agents.apollo_agent import run_apollo_agent
@@ -41,59 +39,19 @@ from agents.github_source_agent import run_github_source_agent
 from agents.hunter_agent import run_hunter_agent
 from agents.scoring_agent import run_scoring_agent
 from agents.talent_intelligence_agent import run_talent_intelligence_agent
+from agents.candidate_merger import merge_sources, merge_enrichment
 from payments.agent_verifier import AgentVerifier
-from payments.nanopayments import NanopaymentsClient, usdc_to_base_units
-from payments.arc_explorer import format_payment_event
+from payments.nanopayments import NanopaymentsClient
+from payments.payment_coordinator import PaymentCoordinator
 from db.models import Search, PaymentLog, Candidate as CandidateORM
 
 log = structlog.get_logger()
-
-# Minimal ABI slices for web3 calls
-ESCROW_DEPOSIT_ABI = [
-    {
-        "name": "deposit",
-        "type": "function",
-        "stateMutability": "nonpayable",
-        "inputs": [
-            {"name": "search_id", "type": "bytes32"},
-            {"name": "amount",    "type": "uint256"},
-        ],
-        "outputs": [],
-    }
-]
-
-ROUTER_PAYMENT_ABI = [
-    {
-        "name": "route_payment",
-        "type": "function",
-        "stateMutability": "nonpayable",
-        "inputs": [
-            {"name": "search_id",     "type": "bytes32"},
-            {"name": "agent_address", "type": "address"},
-            {"name": "action_type",   "type": "string"},
-            {"name": "amount",        "type": "uint256"},
-        ],
-        "outputs": [],
-    }
-]
-
-USDC_APPROVE_ABI = [
-    {
-        "name": "approve",
-        "type": "function",
-        "stateMutability": "nonpayable",
-        "inputs": [
-            {"name": "spender", "type": "address"},
-            {"name": "amount",  "type": "uint256"},
-        ],
-        "outputs": [{"name": "", "type": "bool"}],
-    }
-]
 
 
 class SearchState(TypedDict):
     search_id: str
     job_description: str
+    location_filter: str | None      # explicit location override from SearchRequest
     additional_titles: list          # from JD Enhancement Agent
     parsed_jd: dict | None
     budget_deposited: bool
@@ -126,6 +84,12 @@ class HireFlowOrchestrator:
         self._verifier = AgentVerifier()
         self._nano = NanopaymentsClient()
         self._w3 = Web3(Web3.HTTPProvider(settings.arc_rpc_url))
+        self._payment_coordinator = PaymentCoordinator(
+            db=db,
+            w3=self._w3,
+            private_key=wallet_manager.get_private_key("orchestrator"),
+            broadcast_fn=broadcast_fn,
+        )
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -179,7 +143,7 @@ class HireFlowOrchestrator:
                 amount_usdc=settings.action_prices["/jd/enhance"],
             ))
 
-        await self._batch_record_payments(state["search_id"], payment_records)
+        await self._payment_coordinator.record_batch(state["search_id"], payment_records)
 
         spent = state["total_spent_usdc"]
         if enhanced.enhancement_applied:
@@ -219,7 +183,7 @@ class HireFlowOrchestrator:
             receiving_agent="jd_parser",
             amount_usdc=settings.action_prices["/jd/parse"],
         )]
-        await self._batch_record_payments(state["search_id"], payment_records)
+        await self._payment_coordinator.record_batch(state["search_id"], payment_records)
 
         return {
             "parsed_jd": parsed.model_dump(),
@@ -258,72 +222,28 @@ class HireFlowOrchestrator:
     async def _deposit_escrow_node(self, state: SearchState) -> dict:
         log.info("stage_deposit_escrow", search_id=state["search_id"])
 
-        if not settings.payment_escrow_address:
-            log.warning("escrow_not_deployed", note="skipping — dev mode")
-            return {"budget_deposited": True, "stage": "collect_data"}
+        tx_hash = await self._payment_coordinator.deposit_escrow(state["search_id"])
 
-        # Budget = $0.30 USDC for 25 candidates (design doc: $0.25-0.35)
-        budget_usdc = 0.30
-        budget_units = usdc_to_base_units(budget_usdc)
-        search_id_bytes = bytes.fromhex(state["search_id"].replace("-", ""))[:32]
-
-        try:
-            orchestrator_key = self._wallet_manager.get_private_key("orchestrator")
-            account = self._w3.eth.account.from_key(orchestrator_key)
-
-            usdc = self._w3.eth.contract(
-                address=Web3.to_checksum_address(settings.usdc_contract_address),
-                abi=USDC_APPROVE_ABI,
-            )
-            approve_tx = usdc.functions.approve(
-                Web3.to_checksum_address(settings.payment_escrow_address),
-                budget_units,
-            ).build_transaction({
-                "from":     account.address,
-                "nonce":    self._w3.eth.get_transaction_count(account.address),
-                "gas":      100_000,
-                "gasPrice": self._w3.eth.gas_price,
-            })
-            signed = self._w3.eth.account.sign_transaction(approve_tx, orchestrator_key)
-            self._w3.eth.send_raw_transaction(signed.raw_transaction)
-
-            escrow = self._w3.eth.contract(
-                address=Web3.to_checksum_address(settings.payment_escrow_address),
-                abi=ESCROW_DEPOSIT_ABI,
-            )
-            deposit_tx = escrow.functions.deposit(
-                search_id_bytes, budget_units
-            ).build_transaction({
-                "from":     account.address,
-                "nonce":    self._w3.eth.get_transaction_count(account.address),
-                "gas":      200_000,
-                "gasPrice": self._w3.eth.gas_price,
-            })
-            signed = self._w3.eth.account.sign_transaction(deposit_tx, orchestrator_key)
-            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-
-            if receipt.get("status") == 0:
-                log.error("escrow_deposit_reverted", tx=tx_hash.hex())
-            else:
-                log.info("escrow_deposited", amount_usdc=budget_usdc, tx=tx_hash.hex())
-
+        if tx_hash:
             from sqlalchemy import update
             await self._db.execute(
                 update(Search)
                 .where(Search.id == uuid.UUID(state["search_id"]))
-                .values(escrow_tx_hash=tx_hash.hex())
+                .values(escrow_tx_hash=tx_hash)
             )
             await self._db.commit()
-
-        except Exception as exc:
-            log.error("escrow_deposit_failed", error=str(exc))
 
         return {"budget_deposited": True, "stage": "collect_data"}
 
     async def _collect_data_node(self, state: SearchState) -> dict:
         log.info("stage_collect_data", search_id=state["search_id"])
         parsed_jd = ParsedJD(**state["parsed_jd"])
+
+        # Apply explicit location filter — overrides whatever the JD parser extracted
+        location_filter = state.get("location_filter")
+        if location_filter and location_filter.lower() != "remote":
+            parsed_jd = parsed_jd.model_copy(update={"location": location_filter})
+            log.info("location_filter_applied", location=location_filter)
 
         # ── Step 1: Apollo + GitHub Repo Source in TRUE parallel ───────────────
         apollo_result, github_source_result = await asyncio.gather(
@@ -345,22 +265,7 @@ class HireFlowOrchestrator:
             log.warning("github_source_agent_failed", error=str(github_source_result))
 
         # ── Step 2: Merge Apollo + GitHub Source, deduplicate by github_username ─
-        existing_github_usernames = {
-            c.github_username for c in apollo_candidates if c.github_username
-        }
-        new_from_repos = [
-            c for c in github_source_candidates
-            if c.github_username not in existing_github_usernames
-        ]
-        all_candidates = apollo_candidates + new_from_repos
-
-        log.info(
-            "collect_data_merged",
-            apollo=len(apollo_candidates),
-            github_source=len(github_source_candidates),
-            new_unique_from_repos=len(new_from_repos),
-            total=len(all_candidates),
-        )
+        all_candidates = merge_sources(apollo_candidates, github_source_candidates)
 
         if not all_candidates:
             log.warning("collect_data_empty_results", search_id=state["search_id"])
@@ -387,24 +292,7 @@ class HireFlowOrchestrator:
             hunter_results = all_candidates
 
         # ── Step 4: Merge GitHub and Hunter results ────────────────────────────
-        # Apollo candidates: merge by apollo_id
-        # GitHub-source candidates: merge by github_username (no apollo_id)
-        hunter_by_apollo = {c.apollo_id: c for c in hunter_results if c.apollo_id}
-        hunter_by_github = {c.github_username: c for c in hunter_results if c.github_username and not c.apollo_id}
-
-        merged: list[CandidateEnriched] = []
-        for c in github_results:
-            if c.apollo_id and c.apollo_id in hunter_by_apollo:
-                h = hunter_by_apollo[c.apollo_id]
-                c.email = h.email
-                c.email_confidence = h.email_confidence
-                c.email_status = h.email_status
-            elif c.github_username and c.github_username in hunter_by_github and not c.email:
-                h = hunter_by_github[c.github_username]
-                c.email = h.email
-                c.email_confidence = h.email_confidence
-                c.email_status = h.email_status
-            merged.append(c)
+        merged = merge_enrichment(github_results, hunter_results)
 
         # ── Step 5: Record payments (batch commit once) ────────────────────────
         payment_records = []
@@ -478,7 +366,7 @@ class HireFlowOrchestrator:
                 ))
                 spent += settings.action_prices["/hunter/find"] + settings.action_prices["/hunter/verify"]
 
-        await self._batch_record_payments(state["search_id"], payment_records)
+        await self._payment_coordinator.record_batch(state["search_id"], payment_records)
 
         return {
             "candidates_enriched": [c.model_dump() for c in merged],
@@ -504,7 +392,7 @@ class HireFlowOrchestrator:
             ))
             spent += settings.action_prices["/score/candidate"]
 
-        await self._batch_record_payments(state["search_id"], payment_records)
+        await self._payment_coordinator.record_batch(state["search_id"], payment_records)
 
         return {
             "candidates_scored": [c.model_dump() for c in scored],
@@ -533,7 +421,7 @@ class HireFlowOrchestrator:
                 receiving_agent="talent_intelligence_agent",
                 amount_usdc=settings.action_prices["/talent/intelligence"],
             )]
-            await self._batch_record_payments(state["search_id"], payment_records)
+            await self._payment_coordinator.record_batch(state["search_id"], payment_records)
             spent += settings.action_prices["/talent/intelligence"]
 
         except Exception as exc:
@@ -622,48 +510,6 @@ class HireFlowOrchestrator:
             candidates=len(state["candidates_scored"]),
         )
         return {"stage": "complete"}
-
-    # ─── Helpers ──────────────────────────────────────────────────────────────
-
-    async def _batch_record_payments(
-        self,
-        search_id: str,
-        records: list[dict],
-    ) -> None:
-        """Persist a batch of payment records to DB in a single commit and broadcast each."""
-        if not records:
-            return
-
-        search_uuid = uuid.UUID(search_id)
-        for rec in records:
-            orm_record = PaymentLog(
-                search_id=search_uuid,
-                action_type=rec["action_type"],
-                paying_agent=rec["paying_agent"],
-                receiving_agent=rec["receiving_agent"],
-                amount_usdc=rec["amount_usdc"],
-                status="confirmed",
-            )
-            self._db.add(orm_record)
-
-        # Single commit for the whole batch
-        await self._db.commit()
-
-        # Broadcast each event to WebSocket clients
-        if self._broadcast:
-            for rec in records:
-                event = PaymentEvent(
-                    search_id=search_id,
-                    action_type=rec["action_type"],
-                    paying_agent=rec["paying_agent"],
-                    receiving_agent=rec["receiving_agent"],
-                    amount_usdc=rec["amount_usdc"],
-                    status="confirmed",
-                )
-                try:
-                    await self._broadcast(search_id, event.model_dump(mode="json"))
-                except Exception:
-                    pass
 
     async def run(self, search_id: str, job_description: str) -> SearchState:
         """Execute the full pipeline for a search. Returns final state."""

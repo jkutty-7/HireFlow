@@ -1,5 +1,5 @@
 """
-JD Parser Agent — Kimi K2.5 via ChatNVIDIA.
+JD Parser Agent — Claude Sonnet 4.6 (Anthropic).
 
 Input:  Free-text job description string
 Output: ParsedJD (structured JSON with skills, seniority, location, etc.)
@@ -7,13 +7,14 @@ Output: ParsedJD (structured JSON with skills, seniority, location, etc.)
 Payment: $0.002 USDC per parse via Circle Nanopayments.
 """
 
-import asyncio
 import json
 import re
 import structlog
 
-from langchain_core.tools import tool
-from agents.base import create_kimi_agent
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from settings import settings
 from models.job import ParsedJD
 
 log = structlog.get_logger()
@@ -25,8 +26,8 @@ class JDParseError(Exception):
     """Raised when the LLM returns a response that cannot be parsed into a ParsedJD."""
     pass
 
-JD_PARSER_SYSTEM_PROMPT = """
-You are a technical recruiter assistant that extracts structured hiring criteria
+
+JD_PARSER_SYSTEM_PROMPT = """You are a technical recruiter assistant that extracts structured hiring criteria
 from free-text job descriptions.
 
 When given a job description, respond with ONLY a valid JSON object. Do not include
@@ -50,37 +51,33 @@ Rules:
 - languages: programming languages only (Python, TypeScript, Go, etc.)
 - titles: what Apollo.io search should use as person_titles
 - seniority must be exactly one of: junior, mid, senior, lead, staff
-- years_exp: integer, default to 5 if not specified
-"""
+- years_exp: integer, default to 5 if not specified"""
 
 
 async def parse_job_description(raw_jd: str) -> ParsedJD:
     """
-    Parse a free-text JD into structured ParsedJD using Kimi K2.5.
-    Calls the LangGraph ReAct agent with no tools (pure LLM reasoning).
+    Parse a free-text JD into structured ParsedJD using Claude Sonnet 4.6.
     """
-    agent = create_kimi_agent(tools=[], system_prompt=JD_PARSER_SYSTEM_PROMPT)
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-6",
+        api_key=settings.anthropic_api_key,
+        temperature=0.0,
+        max_tokens=1024,
+    )
 
     try:
-        result = await asyncio.wait_for(
-            agent.ainvoke({"messages": [{"role": "user", "content": raw_jd}]}),
-            timeout=45.0,
-        )
-    except asyncio.TimeoutError:
-        log.error("jd_parse_timeout")
-        raise JDParseError("JD parser timed out after 45 seconds — NVIDIA NIM unavailable")
+        response = await llm.ainvoke([
+            SystemMessage(content=JD_PARSER_SYSTEM_PROMPT),
+            HumanMessage(content=raw_jd),
+        ])
+        content = response.content if hasattr(response, "content") else str(response)
     except Exception as exc:
         log.error("jd_parse_agent_error", error=str(exc)[:200])
         raise JDParseError(f"JD parser agent error: {exc}") from exc
 
-    # Extract the last message content
-    last_message = result["messages"][-1]
-    content = last_message.content if hasattr(last_message, "content") else str(last_message)
-
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        # Attempt to recover JSON embedded in prose or markdown fences
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
             try:
@@ -95,7 +92,6 @@ async def parse_job_description(raw_jd: str) -> ParsedJD:
         raise JDParseError(f"Could not extract valid JSON from JD parser response: {content[:300]}")
 
     try:
-        # Normalise seniority to a valid value
         seniority = str(data.get("seniority", "senior")).lower()
         if seniority not in VALID_SENIORITIES:
             seniority = "senior"

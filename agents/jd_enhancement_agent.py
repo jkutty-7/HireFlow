@@ -1,5 +1,5 @@
 """
-JD Enhancement Agent — Kimi K2.5 via ChatNVIDIA.
+JD Enhancement Agent — Claude Sonnet 4.6 (Anthropic).
 
 Runs BEFORE jd_parser. Expands abbreviated or vague job descriptions so the
 parser and Apollo search produce better results.
@@ -13,18 +13,19 @@ What it does:
 Payment: $0.002 USDC per enhancement via Circle Nanopayments.
 """
 
-import asyncio
 import json
 import re
 import structlog
 
-from agents.base import create_kimi_agent
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from settings import settings
 from models.job import EnhancedJD
 
 log = structlog.get_logger()
 
-JD_ENHANCEMENT_SYSTEM_PROMPT = """
-You are a senior technical recruiter who improves job descriptions for better candidate sourcing.
+JD_ENHANCEMENT_SYSTEM_PROMPT = """You are a senior technical recruiter who improves job descriptions for better candidate sourcing.
 
 Given a job description, your job is to:
 1. Expand it with implied skills/technologies that are standard for this type of role
@@ -42,8 +43,7 @@ Respond with ONLY a valid JSON object — no markdown, no explanation:
   "additional_titles": ["title1", "title2"],
   "additional_keywords": ["keyword1", "keyword2"],
   "enhancement_applied": true
-}
-"""
+}"""
 
 
 async def enhance_job_description(raw_jd: str) -> EnhancedJD:
@@ -61,17 +61,20 @@ async def enhance_job_description(raw_jd: str) -> EnhancedJD:
             enhancement_applied=False,
         )
 
-    agent = create_kimi_agent(tools=[], system_prompt=JD_ENHANCEMENT_SYSTEM_PROMPT, timeout=30)
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-6",
+        api_key=settings.anthropic_api_key,
+        temperature=0.1,
+        max_tokens=2048,
+    )
 
     try:
-        result = await asyncio.wait_for(
-            agent.ainvoke({"messages": [{"role": "user", "content": raw_jd}]}),
-            timeout=30.0,
-        )
-        last_message = result["messages"][-1]
-        content = last_message.content if hasattr(last_message, "content") else str(last_message)
+        response = await llm.ainvoke([
+            SystemMessage(content=JD_ENHANCEMENT_SYSTEM_PROMPT),
+            HumanMessage(content=raw_jd),
+        ])
+        content = response.content if hasattr(response, "content") else str(response)
 
-        # Parse JSON response
         try:
             data = json.loads(content)
         except json.JSONDecodeError:

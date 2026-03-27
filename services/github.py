@@ -16,6 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from settings import settings
 from models.candidate import GitHubProfile, GitHubRepo
+from services.cache import cache_get, cache_set, make_key, GITHUB_PROFILE_TTL
 
 
 # Scoring constants
@@ -179,7 +180,15 @@ class GitHubClient:
           language_match    = (matching_languages / required_languages) * 30
           activity_score    = min(events_last_30_days * 2, 20)
           github_total      = sum of above
+
+        Results are cached for GITHUB_PROFILE_TTL seconds to avoid duplicate
+        API calls when the same username appears in both Apollo and GitHub Source.
         """
+        cache_key = make_key("github_profile", username)
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         profile_data = await self.get_user_profile(username)
         repos = await self.get_user_repos(username)
         events = await self.get_user_events(username)
@@ -224,7 +233,7 @@ class GitHubClient:
 
         github_score = round(stars_score + lang_score + activity_score, 2)
 
-        return GitHubProfile(
+        profile = GitHubProfile(
             username=username,
             name=profile_data.get("name"),
             bio=profile_data.get("bio"),
@@ -237,3 +246,5 @@ class GitHubClient:
             recent_event_count=recent_count,
             github_score=github_score,
         )
+        cache_set(cache_key, profile, GITHUB_PROFILE_TTL)
+        return profile

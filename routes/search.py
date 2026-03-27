@@ -113,17 +113,31 @@ async def get_search_results(
     )
     candidates = cands_result.scalars().all()
 
+    from models.candidate import GitHubProfile
+
+    def _github_data(profile_json: dict | None) -> "GitHubProfile | None":
+        if not profile_json:
+            return None
+        try:
+            return GitHubProfile(**profile_json)
+        except Exception:
+            return None
+
     scored = [
         CandidateScored(
+            apollo_id=c.apollo_id,
             name=c.name,
             title=c.title,
             company=c.company,
             linkedin_url=c.linkedin_url,
             location=c.location,
+            source=c.source or "apollo",
+            source_repos=c.source_repos or [],
             email=c.email,
             email_confidence=c.email_confidence,
             email_status=c.email_status,
             github_username=c.github_username,
+            github_data=_github_data(c.github_profile),
             skill_match_pct=c.skill_match_pct or 0,
             seniority_fit=c.seniority_fit or "unknown",
             github_score=c.github_score or 0,
@@ -132,6 +146,8 @@ async def get_search_results(
             rank_justification=c.rank_justification or "",
             rank=c.rank,
             candidate_id=c.id,
+            skill_match_detail=c.skill_match_detail or [],
+            skill_gaps=c.skill_gaps or [],
         )
         for c in candidates
     ]
@@ -212,6 +228,8 @@ def _estimate_progress(status: str) -> float:
 def _map_email_validity(status: str | None, confidence: int | None) -> str:
     if status == "valid" and (confidence or 0) >= 80:
         return "verified"
+    if status == "risky":
+        return "risky"
     if status and status != "unknown":
         return "unverified"
     return "missing"
