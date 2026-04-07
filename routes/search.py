@@ -54,6 +54,7 @@ async def start_search(
         str(search_id),
         request.job_description,
         request.max_candidates,
+        request.location_filter,
     )
 
     log.info("search_started", search_id=str(search_id))
@@ -190,7 +191,12 @@ async def get_search_results(
 
 # ─── Background Pipeline Runner ──────────────────────────────────────────────
 
-async def _run_pipeline(search_id: str, job_description: str, max_candidates: int):
+async def _run_pipeline(
+    search_id: str,
+    job_description: str,
+    max_candidates: int,
+    location_filter: str | None = None,
+):
     """Background task: runs the full orchestrator pipeline."""
     from db.database import AsyncSessionLocal
     from agents.orchestrator import HireFlowOrchestrator
@@ -206,7 +212,7 @@ async def _run_pipeline(search_id: str, job_description: str, max_candidates: in
             broadcast_fn=ws_manager.broadcast,
         )
         try:
-            await orchestrator.run(search_id, job_description)
+            await orchestrator.run(search_id, job_description, location_filter)
         except Exception as exc:
             log.error("pipeline_failed", search_id=search_id, error=str(exc))
             from sqlalchemy import update

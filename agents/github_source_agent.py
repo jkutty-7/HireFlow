@@ -1,22 +1,29 @@
 """
-GitHub Repo Source Agent — discovers candidates from relevant open-source projects.
+GitHub Source Agent — discovers candidates from public GitHub activity.
 
-Strategy:
-  1. Build a GitHub repository search query from the parsed JD (languages + skills)
-  2. Find the top matching repos (sorted by stars)
-  3. Pull each repo's top contributors
-  4. Fetch full GitHub profiles for each unique contributor
-  5. Return as CandidateEnriched objects (github_data already populated — no re-enrichment needed)
+Two complementary discovery paths run in parallel:
 
-Why this works:
-  Developers who have built projects using the exact technologies in the JD are
-  by definition strong signals. Their public repos are living proof of skill.
+  1. REPO PATH: search recently-active repos matching the tech stack, then mine
+     their top contributors. Optimised for "who is currently building with X?"
+     — no star floor, recently-pushed only, archived projects excluded.
+
+  2. USER PATH: search GitHub users directly by primary language (and location
+     if specified). Optimised for "who self-identifies as an X developer in Y?"
+
+Both paths feed into a single deduplicated candidate set, with full GitHub
+profiles fetched for each unique developer.
+
+Why stars/forks don't matter: a recruiter wants developers with hands-on
+experience, not OSS celebrities. A 3-star side project that uses FastAPI is
+just as strong a signal as contributing to FastAPI itself — both prove the
+person has shipped working code with that stack.
 
 Payment: $0.001 per repo search + $0.001 per repo scanned for contributors.
 """
 
 import asyncio
 import structlog
+from datetime import datetime, timedelta, timezone
 
 from services.github import GitHubClient
 from models.candidate import CandidateEnriched, GitHubProfile
@@ -33,25 +40,33 @@ _QUERY_LANG_MAP: dict[str, str] = {
     "c#": "csharp",
 }
 
+# How recent is "actively developed"
+_RECENCY_DAYS = 365
+
+
+def _normalize_language(lang: str) -> str:
+    return _QUERY_LANG_MAP.get(lang.lower(), lang.lower())
+
 
 def _build_repo_query(parsed_jd: ParsedJD) -> str:
     """
     Construct a GitHub repository search query from the JD.
 
-    Strategy:
-    - Use the primary language as a language: filter (most precise signal)
-    - Add top 3 skill keywords as free-text terms (repo description/readme match)
-    - Require at least 5 stars to exclude toy/empty projects
+    Strategy (relaxed — stars don't matter, recency does):
+    - Filter on primary language for precision
+    - Add top 3 skill keywords as free-text (matched in description/README/topics)
+    - Restrict to repos pushed in the last year (proves active development)
+    - Exclude archived projects (no point sourcing from dead code)
 
-    Example output: "language:python fastapi postgresql async stars:>5"
+    Example output:
+        "language:python fastapi postgresql archived:false pushed:>2025-04-07"
     """
     parts: list[str] = []
 
     # Primary language filter
     languages = parsed_jd.languages or []
     if languages:
-        primary = _QUERY_LANG_MAP.get(languages[0].lower(), languages[0].lower())
-        parts.append(f"language:{primary}")
+        parts.append(f"language:{_normalize_language(languages[0])}")
 
     # Top skill keywords (avoid duplicating the language)
     lang_set = {l.lower() for l in languages}
@@ -61,10 +76,12 @@ def _build_repo_query(parsed_jd: ParsedJD) -> str:
     ][:3]
     parts.extend(skill_keywords)
 
-    # Minimum stars filter — keeps results meaningful
-    parts.append("stars:>5")
+    # Recency + non-archived — filter out dead/abandoned work
+    parts.append("archived:false")
+    recent_date = (datetime.now(timezone.utc) - timedelta(days=_RECENCY_DAYS)).strftime("%Y-%m-%d")
+    parts.append(f"pushed:>{recent_date}")
 
-    return " ".join(parts) if parts else "stars:>50"
+    return " ".join(parts) if parts else f"pushed:>{recent_date}"
 
 
 async def _candidate_from_github_profile(
@@ -119,61 +136,144 @@ async def _candidate_from_github_profile(
         return None
 
 
+async def _discover_via_repos(
+    client: GitHubClient,
+    parsed_jd: ParsedJD,
+    max_repos: int,
+    max_contributors_per_repo: int,
+) -> dict[str, list[str]]:
+    """
+    REPO PATH: search recently-active repos matching the stack, mine contributors.
+    Returns: {github_username: [list of repo full_names they contributed to]}
+    """
+    query = _build_repo_query(parsed_jd)
+    log.info("github_source_repo_query", query=query, max_repos=max_repos)
+
+    try:
+        repos = await client.search_repos(query, max_repos=max_repos, sort="updated")
+    except Exception as exc:
+        log.warning("github_source_repo_search_failed", error=str(exc))
+        return {}
+
+    if not repos:
+        log.info("github_source_no_repos", query=query)
+        return {}
+
+    log.info(
+        "github_source_repos_found",
+        count=len(repos),
+        repos=[r["full_name"] for r in repos],
+    )
+
+    contributor_repos: dict[str, list[str]] = {}
+    contributor_tasks = [
+        client.get_repo_contributors(r["owner"], r["name"], max_contributors=max_contributors_per_repo)
+        for r in repos
+    ]
+    results = await asyncio.gather(*contributor_tasks, return_exceptions=True)
+
+    for repo, result in zip(repos, results):
+        if isinstance(result, Exception):
+            log.warning("github_source_contributors_failed", repo=repo["full_name"], error=str(result))
+            continue
+        for contributor in result:
+            login = contributor["login"]
+            contributor_repos.setdefault(login, []).append(repo["full_name"])
+
+    return contributor_repos
+
+
+async def _discover_via_users(
+    client: GitHubClient,
+    parsed_jd: ParsedJD,
+    max_users: int,
+) -> list[str]:
+    """
+    USER PATH: search GitHub users directly by primary language (and location
+    if the JD specified one). Returns a list of usernames.
+
+    Skipped if the JD has no language — without that filter, results are noise.
+    """
+    languages = parsed_jd.languages or []
+    if not languages:
+        log.debug("github_source_user_search_skipped", reason="no_language_in_jd")
+        return []
+
+    primary_language = _normalize_language(languages[0])
+
+    # Use parsed_jd.location only if it's an actual place (not "Remote")
+    location = parsed_jd.location or ""
+    location_arg = location if location and location.lower() != "remote" else None
+
+    log.info(
+        "github_source_user_query",
+        language=primary_language,
+        location=location_arg,
+        max_users=max_users,
+    )
+
+    try:
+        usernames = await client.search_users(
+            language=primary_language,
+            location=location_arg,
+            min_followers=0,   # fame doesn't matter
+            min_repos=2,       # but they should have built *something*
+            per_page=max_users,
+            sort="repositories",
+        )
+    except Exception as exc:
+        log.warning("github_source_user_search_failed", error=str(exc))
+        return []
+
+    log.info("github_source_users_found", count=len(usernames))
+    return usernames
+
+
 async def run_github_source_agent(
     parsed_jd: ParsedJD,
     max_repos: int = 5,
     max_contributors_per_repo: int = 10,
+    max_users: int = 10,
     concurrency: int = 3,
 ) -> list[CandidateEnriched]:
     """
-    Discover candidates by mining contributors from relevant GitHub repositories.
+    Discover candidates via two parallel paths:
 
-    Returns a list of CandidateEnriched with github_data already populated.
-    The caller should deduplicate against Apollo candidates by github_username.
+      1. Repo path — mine contributors of recently-active repos in the stack
+      2. User path — search GitHub users by primary language (+ location)
+
+    Both paths feed into a single deduplicated set of GitHub usernames, then
+    each unique developer's full profile is fetched and converted into a
+    CandidateEnriched. The caller should further deduplicate against Apollo
+    results by github_username.
     """
     client = GitHubClient()
     try:
-        query = _build_repo_query(parsed_jd)
-        log.info("github_source_search", query=query, max_repos=max_repos)
+        # ── Step 1: Run repo + user discovery in parallel ──────────────────────
+        contributor_repos, user_search_logins = await asyncio.gather(
+            _discover_via_repos(client, parsed_jd, max_repos, max_contributors_per_repo),
+            _discover_via_users(client, parsed_jd, max_users),
+        )
 
-        # ── Step 1: Find matching repos ────────────────────────────────────────
-        try:
-            repos = await client.search_repos(query, max_repos=max_repos)
-        except Exception as exc:
-            log.warning("github_source_repo_search_failed", error=str(exc))
+        # ── Step 2: Merge sources, tagging which repos each candidate came from ─
+        # username → list of repo full_names (or ["github_user_search"] for user-search hits)
+        all_candidates: dict[str, list[str]] = dict(contributor_repos)
+        for login in user_search_logins:
+            if login not in all_candidates:
+                all_candidates[login] = ["github_user_search"]
+
+        if not all_candidates:
+            log.info("github_source_no_candidates")
             return []
 
-        if not repos:
-            log.info("github_source_no_repos", query=query)
-            return []
+        log.info(
+            "github_source_unique_candidates",
+            total=len(all_candidates),
+            from_repos=len(contributor_repos),
+            from_user_search=len(user_search_logins),
+        )
 
-        log.info("github_source_repos_found", count=len(repos), repos=[r["full_name"] for r in repos])
-
-        # ── Step 2: Collect contributors from all repos ────────────────────────
-        # contributor_login → list of repos they appear in
-        contributor_repos: dict[str, list[str]] = {}
-
-        contributor_tasks = [
-            client.get_repo_contributors(r["owner"], r["name"], max_contributors=max_contributors_per_repo)
-            for r in repos
-        ]
-        results = await asyncio.gather(*contributor_tasks, return_exceptions=True)
-
-        for repo, result in zip(repos, results):
-            if isinstance(result, Exception):
-                log.warning("github_source_contributors_failed", repo=repo["full_name"], error=str(result))
-                continue
-            for contributor in result:
-                login = contributor["login"]
-                contributor_repos.setdefault(login, []).append(repo["full_name"])
-
-        if not contributor_repos:
-            log.info("github_source_no_contributors")
-            return []
-
-        log.info("github_source_unique_contributors", count=len(contributor_repos))
-
-        # ── Step 3: Build candidate profiles (rate-limited via semaphore) ───────
+        # ── Step 3: Build full candidate profiles (rate-limited via semaphore) ─
         semaphore = asyncio.Semaphore(concurrency)
         required_languages = parsed_jd.languages or []
 
@@ -185,7 +285,7 @@ async def run_github_source_agent(
 
         profile_tasks = [
             _fetch_one(login, repos_list)
-            for login, repos_list in contributor_repos.items()
+            for login, repos_list in all_candidates.items()
         ]
         profiles = await asyncio.gather(*profile_tasks, return_exceptions=True)
 
@@ -197,8 +297,6 @@ async def run_github_source_agent(
 
         log.info(
             "github_source_done",
-            repos_scanned=len(repos),
-            contributors_found=len(contributor_repos),
             candidates_built=len(candidates),
         )
         return candidates

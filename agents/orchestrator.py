@@ -48,6 +48,32 @@ from db.models import Search, PaymentLog, Candidate as CandidateORM
 log = structlog.get_logger()
 
 
+# Common Indian city/region aliases for fuzzy location matching.
+# A candidate's GitHub/Apollo location string is matched if it contains ANY alias.
+_LOCATION_ALIASES: dict[str, list[str]] = {
+    "bangalore":   ["bangalore", "bengaluru", "blr"],
+    "bengaluru":   ["bangalore", "bengaluru", "blr"],
+    "mumbai":      ["mumbai", "bombay"],
+    "kolkata":     ["kolkata", "calcutta"],
+    "chennai":     ["chennai", "madras"],
+    "kerala":      ["kerala", "kochi", "ernakulam", "trivandrum",
+                    "thiruvananthapuram", "kozhikode", "calicut", "thrissur"],
+}
+
+
+def _matches_location(candidate_location: str | None, filter_text: str) -> bool:
+    """
+    Strict case-insensitive partial match with city-name alias support.
+    Candidates with no location are dropped (the user asked for a specific place).
+    """
+    if not candidate_location:
+        return False
+    cand_lower = candidate_location.lower()
+    filter_lower = filter_text.lower().strip()
+    aliases = _LOCATION_ALIASES.get(filter_lower, [filter_lower])
+    return any(alias in cand_lower for alias in aliases)
+
+
 class SearchState(TypedDict):
     search_id: str
     job_description: str
@@ -266,6 +292,22 @@ class HireFlowOrchestrator:
 
         # ── Step 2: Merge Apollo + GitHub Source, deduplicate by github_username ─
         all_candidates = merge_sources(apollo_candidates, github_source_candidates)
+
+        # ── Step 2.5: Apply explicit location filter (if set) ──────────────────
+        # Drop candidates whose location doesn't match BEFORE running enrichment,
+        # so we don't pay GitHub/Hunter credits on candidates we'll discard.
+        if location_filter and location_filter.lower() != "remote":
+            before_count = len(all_candidates)
+            all_candidates = [
+                c for c in all_candidates
+                if _matches_location(c.location, location_filter)
+            ]
+            log.info(
+                "location_filter_post_merge",
+                location=location_filter,
+                kept=len(all_candidates),
+                dropped=before_count - len(all_candidates),
+            )
 
         if not all_candidates:
             log.warning("collect_data_empty_results", search_id=state["search_id"])
@@ -511,11 +553,17 @@ class HireFlowOrchestrator:
         )
         return {"stage": "complete"}
 
-    async def run(self, search_id: str, job_description: str) -> SearchState:
+    async def run(
+        self,
+        search_id: str,
+        job_description: str,
+        location_filter: str | None = None,
+    ) -> SearchState:
         """Execute the full pipeline for a search. Returns final state."""
         initial_state: SearchState = {
             "search_id":           search_id,
             "job_description":     job_description,
+            "location_filter":     location_filter,
             "additional_titles":   [],
             "parsed_jd":           None,
             "budget_deposited":    False,

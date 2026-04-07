@@ -63,16 +63,34 @@ class GitHubClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     async def search_users(
         self,
-        language: str,
-        location: str,
-        min_followers: int = 10,
+        language: str | None = None,
+        location: str | None = None,
+        min_followers: int = 0,
+        min_repos: int = 0,
         per_page: int = 30,
+        sort: str = "repositories",  # repositories | followers | joined
     ) -> list[str]:
-        """Return list of GitHub usernames matching criteria."""
-        query = f"language:{language} location:{location} followers:>{min_followers}"
+        """
+        Return list of GitHub usernames matching the given filters.
+        All filters are optional — pass None/0 to skip them.
+
+        Stars and follower counts are de-emphasised: developers with active
+        repos in the right stack matter more than fame.
+        """
+        parts: list[str] = ["type:user"]
+        if language:
+            parts.append(f"language:{language}")
+        if location:
+            parts.append(f"location:{location}")
+        if min_followers > 0:
+            parts.append(f"followers:>={min_followers}")
+        if min_repos > 0:
+            parts.append(f"repos:>={min_repos}")
+
+        query = " ".join(parts)
         resp = await self._client.get(
             "/search/users",
-            params={"q": query, "per_page": per_page, "sort": "followers"},
+            params={"q": query, "per_page": per_page, "sort": sort, "order": "desc"},
         )
         resp.raise_for_status()
         return [item["login"] for item in resp.json().get("items", [])]
@@ -125,11 +143,22 @@ class GitHubClient:
         return resp.json()
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
-    async def search_repos(self, query: str, max_repos: int = 5) -> list[dict]:
-        """Search GitHub repositories by tech-stack query, sorted by stars."""
+    async def search_repos(
+        self,
+        query: str,
+        max_repos: int = 5,
+        sort: str = "updated",  # updated | stars | forks | help-wanted-issues
+    ) -> list[dict]:
+        """
+        Search GitHub repositories by tech-stack query.
+
+        Default sort is `updated` (most-recently-pushed first) — this surfaces
+        active developers regardless of project fame, instead of biasing toward
+        a handful of famous OSS projects.
+        """
         resp = await self._client.get(
             "/search/repositories",
-            params={"q": query, "sort": "stars", "order": "desc", "per_page": max_repos},
+            params={"q": query, "sort": sort, "order": "desc", "per_page": max_repos},
         )
         resp.raise_for_status()
         return [
