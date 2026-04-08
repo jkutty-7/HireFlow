@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     agent_registry_address: str = Field(default="")
     payment_escrow_address: str = Field(default="")
     payment_router_address: str = Field(default="")
+    
 
     # ─── Circle Wallet IDs ───────────────────────────────────
     orchestrator_wallet_id: str = Field(default="")
@@ -65,8 +66,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     secret_key: str = Field(default="change-me-to-a-random-32-char-string")
     cors_origins: list[str] = Field(
-        default=["http://localhost:3000", "http://localhost:3001"],
+        default=["http://localhost:3000", "http://localhost:3001", "http://localhost:5173"],
         description="Allowed CORS origins — override in production",
+    )
+    api_keys: list[str] = Field(
+        default_factory=list,
+        description="Valid API keys for recruiter routes. Empty list = dev mode (no auth).",
     )
 
     # ─── Derived / Computed ───────────────────────────────────

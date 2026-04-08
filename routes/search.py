@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from auth.dependencies import verify_api_key
 from db.database import get_db
 from db.models import Search, Candidate as CandidateORM
 from models.search import SearchRequest, SearchStatus, SearchResult
@@ -30,6 +31,7 @@ async def start_search(
     request: SearchRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """
     Start a new hiring search pipeline.
@@ -74,6 +76,7 @@ async def start_search(
 async def get_search_status(
     search_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """Poll the status of a running or completed search."""
     result = await db.execute(select(Search).where(Search.id == search_id))
@@ -97,6 +100,7 @@ async def get_search_status(
 async def get_search_results(
     search_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """Retrieve the ranked candidate results for a completed search."""
     result = await db.execute(select(Search).where(Search.id == search_id))
@@ -142,13 +146,20 @@ async def get_search_results(
             skill_match_pct=c.skill_match_pct or 0,
             seniority_fit=c.seniority_fit or "unknown",
             github_score=c.github_score or 0,
-            email_validity=_map_email_validity(c.email_status, c.email_confidence),
+            # Use persisted email_validity if available; fall back to recomputing for old records
+            email_validity=c.email_validity or _map_email_validity(c.email_status, c.email_confidence),
             composite_score=c.composite_score or 0,
             rank_justification=c.rank_justification or "",
             rank=c.rank,
             candidate_id=c.id,
             skill_match_detail=c.skill_match_detail or [],
             skill_gaps=c.skill_gaps or [],
+            # Enrichment fields — now persisted; no longer recomputed on every request
+            skills=c.skills or [],
+            employment_history=c.employment_history or [],
+            avg_tenure_months=c.avg_tenure_months,
+            is_job_hopper=c.is_job_hopper or False,
+            career_trajectory=c.career_trajectory,
         )
         for c in candidates
     ]
@@ -245,6 +256,7 @@ def _map_email_validity(status: str | None, confidence: int | None) -> str:
 async def get_intelligence_report(
     search_id: str,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """
     Return the Talent Intelligence Report for a completed search.

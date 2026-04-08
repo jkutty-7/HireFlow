@@ -11,6 +11,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from auth.dependencies import verify_api_key
 from db.database import get_db
 from services.circle_wallets import CircleWalletsClient
 from services.circle_bridge import CircleBridgeClient
@@ -40,7 +41,7 @@ class BridgeRequestBody(BaseModel):
 
 
 @router.get("/api/wallets/balances", response_model=list[WalletBalance])
-async def get_all_balances(db: AsyncSession = Depends(get_db)):
+async def get_all_balances(db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """Return USDC balances for all HireFlow agent wallets."""
     from db.models import AgentWallet
     from sqlalchemy import select
@@ -73,7 +74,7 @@ async def get_all_balances(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/api/bridge")
-async def bridge_usdc_to_arc(body: BridgeRequestBody):
+async def bridge_usdc_to_arc(body: BridgeRequestBody, _: str = Depends(verify_api_key)):
     """
     Bridge USDC from Base/Ethereum/Polygon → Arc testnet.
     Called during recruiter onboarding to fund their search wallet.
@@ -96,7 +97,7 @@ async def bridge_usdc_to_arc(body: BridgeRequestBody):
 
 
 @router.get("/api/bridge/{transfer_id}")
-async def get_bridge_status(transfer_id: str):
+async def get_bridge_status(transfer_id: str, _: str = Depends(verify_api_key)):
     """Poll the status of a cross-chain USDC transfer."""
     client = CircleBridgeClient()
     try:
@@ -107,7 +108,7 @@ async def get_bridge_status(transfer_id: str):
 
 
 @router.get("/api/wallets/{wallet_id}/balance")
-async def get_wallet_balance(wallet_id: str):
+async def get_wallet_balance(wallet_id: str, _: str = Depends(verify_api_key)):
     """Get unified cross-chain USDC balance for a specific wallet via Circle Gateway."""
     gateway = CircleGatewayClient()
     try:

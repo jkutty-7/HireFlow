@@ -520,6 +520,13 @@ class HireFlowOrchestrator:
                 skill_gaps=c.get("skill_gaps"),
                 source=c.get("source", "apollo"),
                 source_repos=c.get("source_repos") or None,
+                # Enrichment fields — persisted to avoid on-the-fly recomputation
+                skills=c.get("skills") or None,
+                employment_history=c.get("employment_history") or None,
+                avg_tenure_months=c.get("avg_tenure_months"),
+                is_job_hopper=c.get("is_job_hopper"),
+                career_trajectory=c.get("career_trajectory"),
+                email_validity=c.get("email_validity"),
             )
             self._db.add(orm_candidate)
 

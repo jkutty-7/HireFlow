@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from auth.dependencies import verify_api_key
 from db.database import get_db
 from db.models import PaymentLog as PaymentLogORM
 from models.payment import TransactionLog
@@ -23,6 +24,7 @@ router = APIRouter(prefix="/api/payments", tags=["payments"])
 async def get_payment_feed(
     search_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """
     Return all payment events for a given search, ordered by creation time.
@@ -55,6 +57,7 @@ async def get_payment_feed(
 async def get_payment_summary(
     search_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ):
     """Return aggregate cost breakdown by action type for a search."""
     result = await db.execute(
