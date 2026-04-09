@@ -3,12 +3,18 @@ from sqlalchemy.orm import DeclarativeBase
 
 from settings import settings
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.log_level == "DEBUG",
-    pool_size=10,
-    max_overflow=20,
-)
+_db_url = settings.database_url
+_engine_kwargs: dict = {"echo": settings.log_level == "DEBUG"}
+if "sqlite" not in _db_url:
+    _engine_kwargs["pool_size"] = 10
+    _engine_kwargs["max_overflow"] = 20
+else:
+    # SQLite in-memory: use StaticPool so all connections share the same DB
+    from sqlalchemy.pool import StaticPool
+    _engine_kwargs["poolclass"] = StaticPool
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_async_engine(_db_url, **_engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
