@@ -26,7 +26,8 @@ from payments.wallet_manager import LocalWalletManager
 
 def _make_parsed_jd() -> ParsedJD:
     return ParsedJD(
-        skills=["Python", "FastAPI"],
+        required_skills=["Python", "FastAPI"],
+        optional_skills=["Docker"],
         seniority="senior",
         location="Remote",
         years_exp=5,

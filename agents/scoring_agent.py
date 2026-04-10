@@ -1,15 +1,11 @@
 """
 AI Scoring Agent — Claude Sonnet 4.6 (Anthropic).
 
-The ONLY agent that uses Claude. Chosen for deep multi-factor reasoning
-and the ability to write coherent justifications.
-
 Phase 2 improvements:
-  - Structured per-skill semantic matching (separate LLM call per candidate)
+  - Single LLM call per candidate (merged skill match + justification → 50% cost reduction)
+  - Required vs optional skill weighting (required=1.0, optional=0.5)
   - Deterministic Python composite formula (not delegated to LLM)
-  - Extended 4-5 sentence justifications including skill gap specifics
   - Output validation with safe fallbacks
-  - Correct seniority/email normalisation before composite calculation
 
 Input:  List of CandidateEnriched + ParsedJD
 Output: List of CandidateScored (sorted by composite_score desc)
@@ -35,10 +31,10 @@ log = structlog.get_logger()
 # ─── Scoring tables ───────────────────────────────────────────────────────────
 
 SENIORITY_SCORE: dict[str, float] = {
-    "match": 20.0,
-    "over":  10.0,
-    "under":  5.0,
-    "unknown": 0.0,
+    "match":   20.0,
+    "over":    10.0,
+    "under":    5.0,
+    "unknown":  0.0,
 }
 EMAIL_SCORE: dict[str, float] = {
     "verified":   10.0,
@@ -73,109 +69,88 @@ def compute_composite_score(
     return round(min(max(raw, 0.0), 100.0), 2)
 
 
-# ─── Skill matching prompt ────────────────────────────────────────────────────
+def _compute_skill_match_pct(
+    match_detail: list[dict],
+    required_skills: list[str],
+    optional_skills: list[str],
+) -> tuple[float, list[str]]:
+    """
+    Weighted skill_match_pct:
+      - matched required skill = 1.0 point
+      - matched optional skill = 0.5 points
+    Max achievable = len(required) * 1.0 + len(optional) * 0.5
 
-SKILL_MATCH_SYSTEM_PROMPT = """
-You are a technical recruiter assessing skill alignment between a job description and a candidate.
+    Returns (skill_match_pct, skill_gaps).
+    """
+    if not match_detail:
+        return 0.0, list(required_skills)
 
-For each required skill, output a JSON array where each item is:
-{"skill": "<required skill>", "matched": true|false, "matched_via": "<exact skill or equivalent, or null>"}
+    req_set  = {s.lower() for s in required_skills}
+    opt_set  = {s.lower() for s in optional_skills}
+    max_score = len(required_skills) * 1.0 + len(optional_skills) * 0.5
+    if max_score == 0:
+        return 0.0, []
 
-Matching rules:
+    achieved = 0.0
+    gaps: list[str] = []
+    for m in match_detail:
+        skill_lower = m.get("skill", "").lower()
+        matched = bool(m.get("matched"))
+        is_req = skill_lower in req_set
+        is_opt = skill_lower in opt_set
+
+        if matched:
+            achieved += 1.0 if is_req else 0.5
+        else:
+            if is_req:
+                gaps.append(m["skill"])
+            # optional misses are not shown as gaps
+
+    pct = round(achieved / max_score * 100, 1)
+    return min(pct, 100.0), gaps
+
+
+# ─── Combined single-call scoring prompt ────────────────────────────────────
+
+COMBINED_SCORING_PROMPT = """
+You are a senior technical recruiter evaluating a software engineering candidate.
+
+Respond with ONLY a JSON object containing exactly these fields:
+{
+  "skill_matches": [
+    {"skill": "<skill name>", "matched": true|false, "matched_via": "<exact candidate skill or null>", "is_required": true|false}
+  ],
+  "seniority_fit": "under | match | over",
+  "email_validity": "verified | unverified | risky | missing",
+  "rank_justification": "<4-5 sentence assessment>"
+}
+
+Skill matching rules:
+- Include every skill from BOTH required_skills and optional_skills in skill_matches
 - "Node.js" matches "JavaScript", "Express", "TypeScript" → matched=true
 - "FastAPI" matches "Python", "Starlette", "Python web framework" → matched=true
 - "React" does NOT match "Angular" or "Vue" → matched=false
 - "PostgreSQL" matches "SQL", "relational databases", "Postgres" → matched=true
 - Use the candidate's job title and company to infer unstated skills
-  (e.g. "Senior Backend Engineer at Stripe" implies distributed systems, API design)
-- If a skill is listed in a different casing or abbreviation, treat as matched
-
-Return ONLY the JSON array — no explanation, no markdown.
-"""
-
-
-async def match_skills_structured(
-    candidate: CandidateEnriched,
-    parsed_jd: ParsedJD,
-    llm: ChatAnthropic,
-) -> tuple[list[dict], float, list[str]]:
-    """
-    Per-skill semantic matching via structured LLM output.
-    Returns (match_detail, skill_match_pct, skill_gaps).
-    """
-    if not parsed_jd.skills:
-        return [], 0.0, []
-
-    required_str = json.dumps(parsed_jd.skills)
-    candidate_skills_str = json.dumps(candidate.skills) if candidate.skills else "[]"
-
-    user_msg = f"""Required JD skills: {required_str}
-Candidate skills listed: {candidate_skills_str}
-Candidate title/context: {candidate.title or 'Unknown'} at {candidate.company or 'Unknown'}"""
-
-    messages = [
-        SystemMessage(content=SKILL_MATCH_SYSTEM_PROMPT),
-        HumanMessage(content=user_msg),
-    ]
-
-    try:
-        skill_llm = llm.with_config({"max_tokens": 400})
-        response = await skill_llm.ainvoke(messages)
-        content = response.content
-
-        try:
-            match_detail = json.loads(content)
-        except json.JSONDecodeError:
-            arr_match = re.search(r"\[.*\]", content, re.DOTALL)
-            match_detail = json.loads(arr_match.group()) if arr_match else []
-
-        if not isinstance(match_detail, list):
-            match_detail = []
-
-        matched_count = sum(1 for m in match_detail if m.get("matched"))
-        skill_match_pct = round(matched_count / max(len(parsed_jd.skills), 1) * 100, 1)
-        skill_gaps = [m["skill"] for m in match_detail if not m.get("matched")]
-
-        return match_detail, skill_match_pct, skill_gaps
-
-    except Exception as exc:
-        log.warning("skill_match_structured_failed", candidate=candidate.name, error=str(exc))
-        return [], 0.0, list(parsed_jd.skills)
-
-
-# ─── Main scoring prompt ──────────────────────────────────────────────────────
-
-SCORING_SYSTEM_PROMPT = """
-You are a senior technical recruiter evaluating a software engineering candidate.
-
-The skill_match_pct has already been computed — do NOT recalculate it.
-
-Respond with ONLY a JSON object containing exactly these fields:
-{
-  "seniority_fit": "<under | match | over>",
-  "email_validity": "<verified | unverified | risky | missing>",
-  "rank_justification": "<4-5 sentence assessment>"
-}
+- Set is_required=true for required skills, is_required=false for optional skills
 
 rank_justification must cover:
 1. Primary strengths relative to the role
-2. Specific skill gaps (use the skill_gaps list provided)
+2. Specific skill gaps from required_skills (optional misses are minor)
 3. Seniority assessment and reasoning
 4. One actionable note for the interviewer
 5. Any red flags (job-hopping, overqualification, location mismatch)
 
 Be precise and honest. Flag red flags explicitly.
-Respond with ONLY the JSON object — no markdown, no explanation.
+Return ONLY the JSON object — no markdown, no explanation.
 """
 
 
-def _build_candidate_prompt(
+def _build_scoring_prompt(
     candidate: CandidateEnriched,
     parsed_jd: ParsedJD,
-    skill_match_pct: float,
-    skill_gaps: list[str],
 ) -> str:
-    """Build the scoring user prompt for one candidate."""
+    """Build the single combined scoring prompt for one candidate."""
     github_summary = "No GitHub data available."
     if candidate.github_data:
         gh = candidate.github_data
@@ -188,14 +163,14 @@ def _build_candidate_prompt(
             f"Recent activity (last 30 days): {gh.recent_event_count} events."
         )
 
-    email_validity = "missing"
+    email_hint = "missing"
     if candidate.email:
         if candidate.email_status == "valid" and (candidate.email_confidence or 0) >= 80:
-            email_validity = "verified"
+            email_hint = "verified"
         elif candidate.email_status == "risky":
-            email_validity = "risky"
+            email_hint = "risky"
         else:
-            email_validity = "unverified"
+            email_hint = "unverified"
 
     tenure_note = ""
     if candidate.avg_tenure_months is not None:
@@ -205,29 +180,29 @@ def _build_candidate_prompt(
             f", trajectory: {candidate.career_trajectory}"
         )
 
-    skills_str = ", ".join(candidate.skills) if candidate.skills else "not listed"
-    gaps_str   = ", ".join(skill_gaps) if skill_gaps else "none identified"
+    skills_str   = ", ".join(candidate.skills) if candidate.skills else "not listed"
+    req_str      = ", ".join(parsed_jd.required_skills) if parsed_jd.required_skills else "none"
+    opt_str      = ", ".join(parsed_jd.optional_skills) if parsed_jd.optional_skills else "none"
 
     return f"""Job Description Requirements:
-  - Required skills: {', '.join(parsed_jd.skills)}
-  - Seniority: {parsed_jd.seniority}
-  - Location: {parsed_jd.location}
+  - Required skills:  {req_str}
+  - Optional skills:  {opt_str}
+  - Seniority:        {parsed_jd.seniority}
+  - Location:         {parsed_jd.location}
   - Years experience: {parsed_jd.years_exp}+
-  - Programming languages: {', '.join(parsed_jd.languages)}
+  - Languages:        {', '.join(parsed_jd.languages) or 'not specified'}
 
 Candidate Profile:
-  - Name: {candidate.name}
-  - Title: {candidate.title or 'Unknown'}
-  - Company: {candidate.company or 'Unknown'}
+  - Name:     {candidate.name}
+  - Title:    {candidate.title or 'Unknown'}
+  - Company:  {candidate.company or 'Unknown'}
   - Location: {candidate.location or 'Unknown'}
   - Skills listed: {skills_str}
-  - Email: {candidate.email or 'Not found'} (status: {email_validity}){tenure_note}
+  - Email:    {candidate.email or 'Not found'} (status hint: {email_hint}){tenure_note}
   - {github_summary}
 
-Pre-computed skill_match_pct: {skill_match_pct:.1f}%
-Skill gaps (skills required by JD but not found on candidate): {gaps_str}
-
-Assess seniority_fit and provide rank_justification for this candidate.
+Evaluate this candidate against the job description above.
+Include ALL skills from both required_skills and optional_skills in skill_matches.
 """
 
 
@@ -236,17 +211,11 @@ async def score_candidate(
     parsed_jd: ParsedJD,
     llm: ChatAnthropic,
 ) -> CandidateScored:
-    """Score a single candidate using Claude Sonnet 4.6 (two LLM calls)."""
+    """Score a single candidate using ONE Claude Sonnet 4.6 call."""
 
-    # Call 1: structured skill matching
-    skill_match_detail, skill_match_pct, skill_gaps = await match_skills_structured(
-        candidate, parsed_jd, llm
-    )
-
-    # Call 2: seniority + justification
-    prompt = _build_candidate_prompt(candidate, parsed_jd, skill_match_pct, skill_gaps)
+    prompt = _build_scoring_prompt(candidate, parsed_jd)
     messages = [
-        SystemMessage(content=SCORING_SYSTEM_PROMPT),
+        SystemMessage(content=COMBINED_SCORING_PROMPT),
         HumanMessage(content=prompt),
     ]
 
@@ -254,19 +223,15 @@ async def score_candidate(
         response = await llm.ainvoke(messages)
         content = response.content
     except Exception as exc:
-        # Call 2 failed — preserve Call 1 results with partial score
-        log.warning("scoring_justification_failed", candidate=candidate.name, error=str(exc)[:150])
+        log.warning("scoring_failed", candidate=candidate.name, error=str(exc)[:150])
         github_score = float(candidate.github_data.github_score if candidate.github_data else 0)
         return CandidateScored(
             **candidate.model_dump(),
-            skill_match_pct=skill_match_pct,
-            skill_match_detail=skill_match_detail,
-            skill_gaps=skill_gaps,
-            github_score=github_score,
-            composite_score=round(skill_match_pct * 0.40 + github_score * 0.30, 2),
-            rank_justification=f"Partial score — justification unavailable: {exc}",
+            composite_score=round(github_score * 0.30, 2),
+            rank_justification=f"Scoring unavailable: {exc}",
         )
 
+    # ── Parse response ────────────────────────────────────────────────────────
     try:
         score_data = json.loads(content)
     except json.JSONDecodeError:
@@ -282,7 +247,7 @@ async def score_candidate(
     if not score_data:
         log.error("scoring_parse_failed", candidate=candidate.name, response=content[:200])
 
-    # Validate and sanitise LLM outputs
+    # ── Validate LLM outputs ──────────────────────────────────────────────────
     seniority_fit = str(score_data.get("seniority_fit", "unknown")).lower()
     if seniority_fit not in VALID_SENIORITY_FIT:
         seniority_fit = "unknown"
@@ -295,9 +260,19 @@ async def score_candidate(
     if not isinstance(rank_justification, str):
         rank_justification = ""
 
+    # ── Skill match with weighted formula ────────────────────────────────────
+    match_detail: list[dict] = score_data.get("skill_matches", [])
+    if not isinstance(match_detail, list):
+        match_detail = []
+
+    skill_match_pct, skill_gaps = _compute_skill_match_pct(
+        match_detail,
+        parsed_jd.required_skills,
+        parsed_jd.optional_skills,
+    )
+
     github_score = float(candidate.github_data.github_score if candidate.github_data else 0)
 
-    # Deterministic composite — no LLM arithmetic
     composite = compute_composite_score(
         skill_match_pct=skill_match_pct,
         seniority_fit=seniority_fit,
@@ -313,7 +288,7 @@ async def score_candidate(
         email_validity=email_validity,
         composite_score=composite,
         rank_justification=rank_justification,
-        skill_match_detail=skill_match_detail,
+        skill_match_detail=match_detail,
         skill_gaps=skill_gaps,
     )
     log.info(
@@ -329,11 +304,16 @@ async def score_candidate(
 async def run_scoring_agent(
     candidates: list[CandidateEnriched],
     parsed_jd: ParsedJD,
+    market_context: str = "",
 ) -> list[CandidateScored]:
     """
-    Score all candidates concurrently using Claude Sonnet 4.6.
+    Score all candidates concurrently using Claude Sonnet 4.6 (one call per candidate).
     Returns candidates sorted by composite_score descending with rank assigned.
     """
+    system_prompt = COMBINED_SCORING_PROMPT
+    if market_context:
+        system_prompt = f"Market context: {market_context}\n\n{system_prompt}"
+
     llm = ChatAnthropic(
         model="claude-sonnet-4-6",
         api_key=settings.anthropic_api_key,

@@ -1,6 +1,11 @@
 """
 Unit tests for agents/scoring_agent.py.
 
+Phase 2 asserts:
+  - Only ONE LLM call per candidate (merged skill match + justification)
+  - Weighted skill_match_pct: required=1.0pt, optional=0.5pt
+  - Optional skill misses are NOT included in skill_gaps
+
 All LLM calls are mocked — no network or API key required.
 """
 
@@ -11,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from agents.scoring_agent import (
     compute_composite_score,
     score_candidate,
-    match_skills_structured,
+    _compute_skill_match_pct,
     SENIORITY_SCORE,
     EMAIL_SCORE,
 )
@@ -24,7 +29,8 @@ from models.job import ParsedJD
 @pytest.fixture
 def parsed_jd() -> ParsedJD:
     return ParsedJD(
-        skills=["Python", "FastAPI", "PostgreSQL"],
+        required_skills=["Python", "FastAPI", "PostgreSQL"],
+        optional_skills=["Docker", "Terraform"],
         seniority="senior",
         location="Remote",
         years_exp=5,
@@ -109,9 +115,9 @@ class TestComputeCompositeScore:
         assert result == 80.0
 
     def test_risky_email_between_unverified_and_missing(self):
-        risky = compute_composite_score(100.0, "match", 0.0, "risky")
+        risky     = compute_composite_score(100.0, "match", 0.0, "risky")
         unverified = compute_composite_score(100.0, "match", 0.0, "unverified")
-        missing = compute_composite_score(100.0, "match", 0.0, "missing")
+        missing    = compute_composite_score(100.0, "match", 0.0, "missing")
         assert missing < risky < unverified
 
     def test_unknown_seniority_treated_as_zero(self):
@@ -124,148 +130,189 @@ class TestComputeCompositeScore:
         assert result == compute_composite_score(50.0, "unknown", 50.0, "verified")
 
     def test_result_clamped_to_0_100(self):
-        # Should never exceed 100 or go below 0
         assert compute_composite_score(100.0, "match", 100.0, "verified") <= 100.0
         assert compute_composite_score(0.0, "unknown", 0.0, "missing") >= 0.0
 
     def test_over_seniority_lower_than_match(self):
-        match_score = compute_composite_score(80.0, "match", 60.0, "verified")
-        over_score  = compute_composite_score(80.0, "over",  60.0, "verified")
-        assert over_score < match_score
+        assert compute_composite_score(80.0, "over", 60.0, "verified") < \
+               compute_composite_score(80.0, "match", 60.0, "verified")
 
     def test_under_seniority_lower_than_over(self):
-        over_score  = compute_composite_score(80.0, "over",  60.0, "verified")
-        under_score = compute_composite_score(80.0, "under", 60.0, "verified")
-        assert under_score < over_score
+        assert compute_composite_score(80.0, "under", 60.0, "verified") < \
+               compute_composite_score(80.0, "over", 60.0, "verified")
 
 
-# ─── match_skills_structured ──────────────────────────────────────────────────
+# ─── _compute_skill_match_pct ─────────────────────────────────────────────────
 
-class TestMatchSkillsStructured:
-    async def test_happy_path(self, candidate_with_github, parsed_jd, mock_llm):
-        payload = [
-            {"skill": "Python",     "matched": True,  "matched_via": "Python"},
-            {"skill": "FastAPI",    "matched": True,  "matched_via": "FastAPI"},
-            {"skill": "PostgreSQL", "matched": False, "matched_via": None},
+class TestComputeSkillMatchPct:
+    def test_all_required_matched(self):
+        detail = [
+            {"skill": "Python",     "matched": True,  "is_required": True},
+            {"skill": "FastAPI",    "matched": True,  "is_required": True},
+            {"skill": "PostgreSQL", "matched": True,  "is_required": True},
         ]
-        mock_llm.ainvoke.return_value = MagicMock(content=json.dumps(payload))
+        pct, gaps = _compute_skill_match_pct(detail, ["Python", "FastAPI", "PostgreSQL"], [])
+        assert pct == 100.0
+        assert gaps == []
 
-        detail, pct, gaps = await match_skills_structured(
-            candidate_with_github, parsed_jd, mock_llm
-        )
+    def test_optional_miss_not_in_gaps(self):
+        detail = [
+            {"skill": "Python",    "matched": True,  "is_required": True},
+            {"skill": "Terraform", "matched": False, "is_required": False},
+        ]
+        pct, gaps = _compute_skill_match_pct(detail, ["Python"], ["Terraform"])
+        assert "Terraform" not in gaps
+        assert pct > 0.0
 
-        assert len(detail) == 3
-        assert pct == pytest.approx(66.7, abs=0.2)
+    def test_required_miss_appears_in_gaps(self):
+        detail = [
+            {"skill": "Python",      "matched": True,  "is_required": True},
+            {"skill": "PostgreSQL",  "matched": False, "is_required": True},
+        ]
+        pct, gaps = _compute_skill_match_pct(detail, ["Python", "PostgreSQL"], [])
         assert "PostgreSQL" in gaps
-        assert "Python" not in gaps
 
-    async def test_empty_skills_returns_zero(self, candidate_with_github, mock_llm):
-        jd = ParsedJD(skills=[], raw_jd="")
-        detail, pct, gaps = await match_skills_structured(candidate_with_github, jd, mock_llm)
+    def test_optional_miss_reduces_score_less_than_required_miss(self):
+        # Two equal-size scenarios: miss one required vs miss one optional
+        required_miss = [
+            {"skill": "Python",     "matched": True,  "is_required": True},
+            {"skill": "Go",         "matched": False, "is_required": True},
+        ]
+        optional_miss = [
+            {"skill": "Python",    "matched": True,  "is_required": True},
+            {"skill": "Terraform", "matched": False, "is_required": False},
+        ]
+        pct_req_miss, _ = _compute_skill_match_pct(required_miss, ["Python", "Go"], [])
+        pct_opt_miss, _ = _compute_skill_match_pct(optional_miss, ["Python"], ["Terraform"])
+        # Missing a required skill hurts more
+        assert pct_req_miss < pct_opt_miss
+
+    def test_no_skills_returns_zero(self):
+        pct, gaps = _compute_skill_match_pct([], [], [])
         assert pct == 0.0
-        assert detail == []
-        mock_llm.ainvoke.assert_not_called()
+        assert gaps == []
 
-    async def test_llm_returns_invalid_json(self, candidate_with_github, parsed_jd, mock_llm):
-        mock_llm.ainvoke.return_value = MagicMock(content="NOT JSON AT ALL")
-        detail, pct, gaps = await match_skills_structured(
-            candidate_with_github, parsed_jd, mock_llm
-        )
-        # Falls back gracefully — all skills become gaps
+    def test_empty_match_detail_returns_zero(self):
+        pct, gaps = _compute_skill_match_pct([], ["Python", "FastAPI"], [])
         assert pct == 0.0
-        assert set(gaps) == set(parsed_jd.skills)
+        assert gaps == ["Python", "FastAPI"]
 
-    async def test_llm_exception_falls_back(self, candidate_with_github, parsed_jd, mock_llm):
-        mock_llm.ainvoke.side_effect = RuntimeError("API timeout")
-        detail, pct, gaps = await match_skills_structured(
-            candidate_with_github, parsed_jd, mock_llm
-        )
-        assert pct == 0.0
-        assert set(gaps) == set(parsed_jd.skills)
+    def test_all_optional_matched(self):
+        detail = [
+            {"skill": "Terraform", "matched": True, "is_required": False},
+            {"skill": "Docker",    "matched": True, "is_required": False},
+        ]
+        pct, gaps = _compute_skill_match_pct(detail, [], ["Terraform", "Docker"])
+        assert pct == 100.0
+        assert gaps == []
 
 
-# ─── score_candidate ──────────────────────────────────────────────────────────
+# ─── score_candidate — single LLM call ────────────────────────────────────────
 
 class TestScoreCandidate:
-    async def test_full_scoring_pipeline(self, candidate_with_github, parsed_jd, mock_llm):
-        """Two LLM calls: skill match + seniority/justification."""
-        skill_response = json.dumps([
-            {"skill": "Python",     "matched": True,  "matched_via": "Python"},
-            {"skill": "FastAPI",    "matched": True,  "matched_via": "FastAPI"},
-            {"skill": "PostgreSQL", "matched": False, "matched_via": None},
-        ])
-        score_response = json.dumps({
+    async def test_only_one_llm_call(self, candidate_with_github, parsed_jd, mock_llm):
+        """Phase 2.1 key assertion: exactly one LLM call per candidate."""
+        combined_response = json.dumps({
+            "skill_matches": [
+                {"skill": "Python",     "matched": True,  "matched_via": "Python",  "is_required": True},
+                {"skill": "FastAPI",    "matched": True,  "matched_via": "FastAPI", "is_required": True},
+                {"skill": "PostgreSQL", "matched": False, "matched_via": None,      "is_required": True},
+                {"skill": "Docker",     "matched": True,  "matched_via": "Docker",  "is_required": False},
+                {"skill": "Terraform",  "matched": False, "matched_via": None,      "is_required": False},
+            ],
             "seniority_fit":      "match",
             "email_validity":     "verified",
-            "rank_justification": "Strong Python background. Missing PostgreSQL.",
+            "rank_justification": "Strong Python and FastAPI background. Missing PostgreSQL.",
         })
+        mock_llm.ainvoke.return_value = MagicMock(content=combined_response)
 
-        mock_llm.ainvoke.side_effect = [
-            MagicMock(content=skill_response),
-            MagicMock(content=score_response),
-        ]
+        await score_candidate(candidate_with_github, parsed_jd, mock_llm)
+
+        assert mock_llm.ainvoke.call_count == 1
+
+    async def test_optional_miss_not_in_gaps(self, candidate_with_github, parsed_jd, mock_llm):
+        combined = json.dumps({
+            "skill_matches": [
+                {"skill": "Python",    "matched": True,  "matched_via": "Python", "is_required": True},
+                {"skill": "FastAPI",   "matched": True,  "matched_via": "FastAPI","is_required": True},
+                {"skill": "PostgreSQL","matched": True,  "matched_via": "SQL",    "is_required": True},
+                {"skill": "Docker",    "matched": True,  "matched_via": "Docker", "is_required": False},
+                {"skill": "Terraform", "matched": False, "matched_via": None,     "is_required": False},
+            ],
+            "seniority_fit": "match", "email_validity": "verified",
+            "rank_justification": "ok",
+        })
+        mock_llm.ainvoke.return_value = MagicMock(content=combined)
 
         result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
 
-        assert result.seniority_fit == "match"
-        assert result.email_validity == "verified"
-        assert result.skill_match_pct == pytest.approx(66.7, abs=0.2)
-        assert "PostgreSQL" in result.skill_gaps
-        assert result.composite_score > 0
-        assert result.rank_justification != ""
-        assert mock_llm.ainvoke.call_count == 2
+        assert "Terraform" not in result.skill_gaps
 
-    async def test_invalid_seniority_normalised(self, candidate_with_github, parsed_jd, mock_llm):
-        mock_llm.ainvoke.side_effect = [
-            MagicMock(content="[]"),  # skill match
-            MagicMock(content=json.dumps({
-                "seniority_fit":      "BOGUS_VALUE",
-                "email_validity":     "verified",
-                "rank_justification": "ok",
-            })),
-        ]
-        result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
-        assert result.seniority_fit == "unknown"
+    def _full_match_response(self) -> dict:
+        return {
+            "skill_matches": [
+                {"skill": "Python",     "matched": True,  "matched_via": "Python",  "is_required": True},
+                {"skill": "FastAPI",    "matched": True,  "matched_via": "FastAPI", "is_required": True},
+                {"skill": "PostgreSQL", "matched": False, "matched_via": None,      "is_required": True},
+                {"skill": "Docker",     "matched": True,  "matched_via": "Docker",  "is_required": False},
+                {"skill": "Terraform",  "matched": False, "matched_via": None,      "is_required": False},
+            ],
+            "seniority_fit":      "match",
+            "email_validity":     "verified",
+            "rank_justification": "Good candidate.",
+        }
 
-    async def test_risky_email_validity_accepted(self, candidate_with_github, parsed_jd, mock_llm):
-        mock_llm.ainvoke.side_effect = [
-            MagicMock(content="[]"),
-            MagicMock(content=json.dumps({
-                "seniority_fit":      "match",
-                "email_validity":     "risky",
-                "rank_justification": "ok",
-            })),
-        ]
+    async def test_composite_score_computed_deterministically(
+        self, candidate_with_github, parsed_jd, mock_llm
+    ):
+        mock_llm.ainvoke.return_value = MagicMock(content=json.dumps(self._full_match_response()))
         result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
-        assert result.email_validity == "risky"
-        assert result.composite_score == compute_composite_score(
+
+        expected = compute_composite_score(
             result.skill_match_pct,
             "match",
             result.github_score,
-            "risky",
+            "verified",
         )
+        assert result.composite_score == expected
 
-    async def test_no_github_data(self, candidate_no_github, parsed_jd, mock_llm):
-        mock_llm.ainvoke.side_effect = [
-            MagicMock(content="[]"),
-            MagicMock(content=json.dumps({
-                "seniority_fit":      "under",
-                "email_validity":     "missing",
-                "rank_justification": "Junior candidate without GitHub.",
-            })),
-        ]
-        result = await score_candidate(candidate_no_github, parsed_jd, mock_llm)
+    async def test_invalid_seniority_normalised(self, candidate_with_github, parsed_jd, mock_llm):
+        bad = {**self._full_match_response(), "seniority_fit": "BOGUS"}
+        mock_llm.ainvoke.return_value = MagicMock(content=json.dumps(bad))
+        result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
+        assert result.seniority_fit == "unknown"
+
+    async def test_risky_email_accepted(self, candidate_with_github, parsed_jd, mock_llm):
+        risky = {**self._full_match_response(), "email_validity": "risky"}
+        mock_llm.ainvoke.return_value = MagicMock(content=json.dumps(risky))
+        result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
+        assert result.email_validity == "risky"
+
+    async def test_no_github_zero_github_score(self, candidate_no_github, mock_llm):
+        jd = ParsedJD(required_skills=["Python"], optional_skills=[], raw_jd="")
+        resp = {
+            "skill_matches":      [{"skill": "Python", "matched": True, "matched_via": "Python", "is_required": True}],
+            "seniority_fit":      "under",
+            "email_validity":     "missing",
+            "rank_justification": "Junior candidate.",
+        }
+        mock_llm.ainvoke.return_value = MagicMock(content=json.dumps(resp))
+        result = await score_candidate(candidate_no_github, jd, mock_llm)
         assert result.github_score == 0.0
-        assert result.email_validity == "missing"
+        assert mock_llm.ainvoke.call_count == 1
 
-    async def test_second_llm_call_failure_returns_partial(
+    async def test_llm_failure_returns_partial_score(
         self, candidate_with_github, parsed_jd, mock_llm
     ):
-        mock_llm.ainvoke.side_effect = [
-            MagicMock(content="[]"),            # skill match succeeds
-            RuntimeError("Rate limit hit"),     # justification fails
-        ]
+        mock_llm.ainvoke.side_effect = RuntimeError("Rate limit")
         result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
-        # Should not raise — returns a partial CandidateScored
         assert result.composite_score >= 0
         assert "unavailable" in result.rank_justification
+
+    async def test_invalid_json_response_handled_gracefully(
+        self, candidate_with_github, parsed_jd, mock_llm
+    ):
+        mock_llm.ainvoke.return_value = MagicMock(content="NOT JSON")
+        result = await score_candidate(candidate_with_github, parsed_jd, mock_llm)
+        assert result.composite_score >= 0
+        assert mock_llm.ainvoke.call_count == 1

@@ -35,7 +35,8 @@ any explanation or markdown code blocks — raw JSON only.
 
 The JSON must match this schema exactly:
 {
-  "skills": ["list", "of", "required", "technical", "skills"],
+  "required_skills": ["must-have", "technical", "skills"],
+  "optional_skills": ["nice-to-have", "or", "bonus", "skills"],
   "seniority": "junior | mid | senior | lead | staff",
   "location": "city, state or Remote",
   "years_exp": <integer>,
@@ -47,7 +48,10 @@ The JSON must match this schema exactly:
 }
 
 Rules:
-- skills: include frameworks, databases, tools (e.g. FastAPI, PostgreSQL, Docker)
+- required_skills: frameworks, databases, tools explicitly required or strongly implied
+  (e.g. FastAPI, PostgreSQL, Docker). If no clear distinction is given, put all in required_skills.
+- optional_skills: skills marked "nice to have", "bonus", "preferred", "a plus", or clearly secondary.
+  Leave empty [] if the JD doesn't mention any nice-to-have skills.
 - languages: programming languages only (Python, TypeScript, Go, etc.)
 - titles: what Apollo.io search should use as person_titles
 - seniority must be exactly one of: junior, mid, senior, lead, staff
@@ -98,7 +102,12 @@ async def parse_job_description(raw_jd: str) -> ParsedJD:
         data["seniority"] = seniority
 
         parsed = ParsedJD(**data, raw_jd=raw_jd)
-        log.info("jd_parsed", skills=parsed.skills, seniority=parsed.seniority)
+        log.info(
+            "jd_parsed",
+            required_skills=parsed.required_skills,
+            optional_skills=parsed.optional_skills,
+            seniority=parsed.seniority,
+        )
         return parsed
     except Exception as exc:
         log.error("jd_parse_model_failed", error=str(exc), data=str(data)[:200])
