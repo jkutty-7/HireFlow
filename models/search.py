@@ -1,10 +1,39 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 import uuid
 
 from models.candidate import CandidateScored
 from models.payment import TransactionLog
+
+# Valid recruiter pipeline stages for a candidate
+RecruiterStatus = Literal["new", "contacted", "interviewing", "rejected", "hired"]
+
+
+class CandidateStatusUpdate(BaseModel):
+    status: RecruiterStatus
+    note: Optional[str] = Field(None, max_length=2000)
+
+
+class TemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    description: Optional[str] = Field(None, max_length=1000)
+    template_jd: str = Field(..., min_length=20)
+    location_filter: Optional[str] = Field(None, max_length=128)
+    max_candidates: int = Field(default=25, ge=5, le=50)
+
+
+class TemplateResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: Optional[str]
+    template_jd: str
+    location_filter: Optional[str]
+    max_candidates: int
+    use_count: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class SearchRequest(BaseModel):

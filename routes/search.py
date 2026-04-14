@@ -5,18 +5,22 @@ POST /api/search        — start a new hiring search
 GET  /api/search/{id}  — get search status + result
 """
 
+import csv
+import io
 import uuid
 import asyncio
 import structlog
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from auth.dependencies import verify_api_key
 from db.database import get_db
 from db.models import Search, Candidate as CandidateORM
-from models.search import SearchRequest, SearchStatus, SearchResult
+from models.search import SearchRequest, SearchStatus, SearchResult, CandidateStatusUpdate
 from models.candidate import CandidateScored
 
 log = structlog.get_logger()
@@ -223,7 +227,13 @@ async def _run_pipeline(
             broadcast_fn=ws_manager.broadcast,
         )
         try:
-            await orchestrator.run(search_id, job_description, location_filter)
+            final_state = await orchestrator.run(search_id, job_description, location_filter)
+            # Notify any connected frontend clients that the pipeline finished
+            await ws_manager.broadcast(search_id, {
+                "type":            "pipeline_complete",
+                "candidate_count": len(final_state.get("candidates_scored", [])),
+                "total_usdc":      final_state.get("total_spent_usdc", 0.0),
+            })
         except Exception as exc:
             log.error("pipeline_failed", search_id=search_id, error=str(exc))
             from sqlalchemy import update
@@ -250,6 +260,155 @@ def _map_email_validity(status: str | None, confidence: int | None) -> str:
     if status and status != "unknown":
         return "unverified"
     return "missing"
+
+
+@router.get("/{search_id}/candidates")
+async def get_candidates(
+    search_id: uuid.UUID,
+    status: str | None = Query(None, description="Filter by recruiter_status (e.g. contacted)"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """
+    List candidates for a search, optionally filtered by recruiter pipeline stage.
+    Returns lightweight dicts (id, name, rank, composite_score, recruiter_status, notes).
+    """
+    result = await db.execute(select(Search).where(Search.id == search_id))
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Search not found")
+
+    q = select(CandidateORM).where(CandidateORM.search_id == search_id)
+    if status:
+        q = q.where(CandidateORM.recruiter_status == status)
+    q = q.order_by(CandidateORM.rank)
+
+    cands = (await db.execute(q)).scalars().all()
+    return [
+        {
+            "id":               str(c.id),
+            "name":             c.name,
+            "title":            c.title,
+            "company":          c.company,
+            "rank":             c.rank,
+            "composite_score":  c.composite_score,
+            "recruiter_status": c.recruiter_status,
+            "notes":            c.notes,
+            "status_updated_at": c.status_updated_at.isoformat() if c.status_updated_at else None,
+        }
+        for c in cands
+    ]
+
+
+@router.patch("/{search_id}/candidates/{candidate_id}/status", status_code=200)
+async def update_candidate_status(
+    search_id: uuid.UUID,
+    candidate_id: uuid.UUID,
+    body: CandidateStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """
+    Update the recruiter pipeline status for a single candidate.
+    Optionally attach a recruiter note.
+    """
+    result = await db.execute(
+        select(CandidateORM).where(
+            CandidateORM.id == candidate_id,
+            CandidateORM.search_id == search_id,
+        )
+    )
+    candidate = result.scalar_one_or_none()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    now = datetime.now(timezone.utc)
+    values: dict = {"recruiter_status": body.status, "status_updated_at": now}
+    if body.note is not None:
+        values["notes"] = body.note
+
+    await db.execute(
+        update(CandidateORM)
+        .where(CandidateORM.id == candidate_id)
+        .values(**values)
+    )
+    await db.commit()
+
+    log.info(
+        "candidate_status_updated",
+        candidate_id=str(candidate_id),
+        status=body.status,
+    )
+    return {"id": str(candidate_id), "status": body.status, "updated_at": now.isoformat()}
+
+
+@router.get("/{search_id}/export")
+async def export_candidates_csv(
+    search_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """
+    Stream a CSV of all ranked candidates for a completed search.
+    Columns: rank, name, title, company, location, email, email_validity,
+             composite_score, skill_match_pct, github_score, seniority_fit,
+             recruiter_status, skill_gaps, rank_justification, linkedin_url, notes
+    """
+    result = await db.execute(select(Search).where(Search.id == search_id))
+    search = result.scalar_one_or_none()
+    if not search:
+        raise HTTPException(status_code=404, detail="Search not found")
+    if search.status not in ("complete", "failed"):
+        raise HTTPException(status_code=202, detail="Search still running — export not yet available")
+
+    cands_result = await db.execute(
+        select(CandidateORM)
+        .where(CandidateORM.search_id == search_id)
+        .order_by(CandidateORM.rank)
+    )
+    candidates = cands_result.scalars().all()
+
+    fieldnames = [
+        "rank", "name", "title", "company", "location",
+        "email", "email_validity", "composite_score", "skill_match_pct",
+        "github_score", "seniority_fit", "recruiter_status",
+        "skill_gaps", "rank_justification", "linkedin_url", "notes",
+    ]
+
+    def _generate():
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        yield buf.getvalue()
+
+        for c in candidates:
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writerow({
+                "rank":             c.rank or "",
+                "name":             c.name,
+                "title":            c.title or "",
+                "company":          c.company or "",
+                "location":         c.location or "",
+                "email":            c.email or "",
+                "email_validity":   c.email_validity or "",
+                "composite_score":  c.composite_score or 0,
+                "skill_match_pct":  c.skill_match_pct or 0,
+                "github_score":     c.github_score or 0,
+                "seniority_fit":    c.seniority_fit or "",
+                "recruiter_status": c.recruiter_status or "new",
+                "skill_gaps":       "; ".join(c.skill_gaps or []),
+                "rank_justification": c.rank_justification or "",
+                "linkedin_url":     c.linkedin_url or "",
+                "notes":            c.notes or "",
+            })
+            yield buf.getvalue()
+
+    filename = f"hireflow_candidates_{search_id}.csv"
+    return StreamingResponse(
+        _generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{search_id}/intelligence")

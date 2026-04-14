@@ -34,6 +34,7 @@ from payments.x402_middleware import X402PaymentMiddleware
 from routes import search as search_router
 from routes import wallets as wallets_router
 from routes import payments as payments_router
+from routes import templates as templates_router
 
 # Agent name → derived Ethereum address (from private key in .env)
 AGENT_ADDRESSES: dict[str, str] = {}
@@ -160,6 +161,7 @@ app.add_middleware(X402PaymentMiddleware)
 app.include_router(search_router.router)
 app.include_router(wallets_router.router)
 app.include_router(payments_router.router)
+app.include_router(templates_router.router)
 
 
 # ─── WebSocket Endpoint ──────────────────────────────────────────────────────

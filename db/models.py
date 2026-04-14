@@ -98,6 +98,14 @@ class Candidate(Base):
     career_trajectory: Mapped[str | None] = mapped_column(String(32), nullable=True)
     email_validity: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
+    # Recruiter workflow — Phase 3.1
+    # new | contacted | interviewing | rejected | hired
+    recruiter_status: Mapped[str] = mapped_column(String(32), default="new")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -126,6 +134,26 @@ class PaymentLog(Base):
     )
 
     search: Mapped["Search"] = relationship(back_populates="payment_logs")
+
+
+class SearchTemplate(Base):
+    """Saved JD templates so recruiters can re-run common searches quickly."""
+
+    __tablename__ = "search_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    template_jd: Mapped[str] = mapped_column(Text, nullable=False)
+    location_filter: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    max_candidates: Mapped[int] = mapped_column(Integer, default=25)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class AgentWallet(Base):
