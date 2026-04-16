@@ -39,14 +39,18 @@ Respond with ONLY a JSON object with exactly these fields:
   "search_quality_score": <0-100 integer: how good was this candidate pool overall?>,
   "search_quality_notes": "<1-2 sentences explaining the quality score>",
   "red_flags": ["<flag1>", "<flag2>"],
-  "recommended_jd_changes": ["<change1>", "<change2>"]
+  "recommended_jd_changes": ["<change1>", "<change2>"],
+  "market_context_hint": "<one sentence on talent availability for the rarest required skill, e.g. 'Vyper is niche with <500 active developers globally — Solidity+Python should be accepted as equivalent.' Leave empty string if all skills are mainstream.>"
 }
 
-Red flags to look for: job-hopping (avg tenure < 12 months), overqualified (way above seniority required),
-underqualified, thin skill match across the whole pool, no verified emails, location mismatches.
+Red flags: job-hopping (avg tenure < 12 months), overqualified, underqualified,
+thin skill match across the pool, no verified emails, location mismatches.
 
-Recommended JD changes: if the pool is thin or low quality, suggest what to change in the job description
-to attract better candidates (e.g. "Broaden to include mid-level candidates", "Remove Kubernetes requirement").
+Recommended JD changes: if the pool is thin or low quality, suggest concrete improvements
+(e.g. "Broaden to include mid-level candidates", "Remove Kubernetes requirement").
+
+market_context_hint: identify the single rarest required skill and provide a one-sentence
+note on market availability and any acceptable equivalents. Leave as "" for mainstream stacks.
 
 Respond with ONLY the JSON object — no markdown, no explanation.
 """
@@ -229,6 +233,7 @@ async def run_talent_intelligence_agent(
         search_quality_notes=str(pool_data.get("search_quality_notes", "")),
         red_flags=[str(f) for f in pool_data.get("red_flags", [])],
         recommended_jd_changes=[str(c) for c in pool_data.get("recommended_jd_changes", [])],
+        market_context_hint=str(pool_data.get("market_context_hint", "")),
         interview_plans=valid_plans,
         generated_at=datetime.now(timezone.utc),
     )

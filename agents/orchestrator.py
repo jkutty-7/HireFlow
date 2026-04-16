@@ -48,6 +48,47 @@ from db.models import Search, PaymentLog, Candidate as CandidateORM
 log = structlog.get_logger()
 
 
+async def _get_market_context(
+    sample_candidates: list,
+    parsed_jd,
+) -> str:
+    """
+    Single fast LLM call on up to 3 candidates to extract a market-context hint
+    for rare required skills. Returns an empty string when all skills are mainstream.
+    Result is prepended to the scoring system prompt so Claude de-penalises
+    candidates who lack genuinely rare skills.
+    """
+    if not sample_candidates or not parsed_jd.required_skills:
+        return ""
+
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    prompt = (
+        "You are a recruiting analyst. Given the required skills below, identify the "
+        "single rarest skill and write ONE sentence describing its market availability "
+        "and any widely-accepted equivalents a recruiter should accept.\n"
+        "If all skills are mainstream (Python, React, SQL, etc.) respond with an empty string.\n\n"
+        f"Required skills: {', '.join(parsed_jd.required_skills)}\n\n"
+        "Respond with ONLY the sentence or an empty string — no explanation."
+    )
+
+    try:
+        llm = ChatAnthropic(
+            model="claude-sonnet-4-6",
+            api_key=settings.anthropic_api_key,
+            temperature=0.0,
+            max_tokens=120,
+        )
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        hint = (response.content or "").strip()
+        log.info("market_context_hint", hint=hint[:100])
+        return hint
+    except Exception as exc:
+        log.warning("market_context_failed", error=str(exc))
+        return ""
+
+
 # Common Indian city/region aliases for fuzzy location matching.
 # A candidate's GitHub/Apollo location string is matched if it contains ANY alias.
 _LOCATION_ALIASES: dict[str, list[str]] = {
@@ -419,9 +460,13 @@ class HireFlowOrchestrator:
     async def _score_candidates_node(self, state: SearchState) -> dict:
         log.info("stage_score_candidates", search_id=state["search_id"])
         parsed_jd = ParsedJD(**state["parsed_jd"])
-
         enriched = [CandidateEnriched(**c) for c in state["candidates_enriched"]]
-        scored = await run_scoring_agent(enriched, parsed_jd)
+
+        # Phase 4.3: fast market-context pre-pass on the first 3 candidates
+        # so the scoring prompt is aware of rare-skill availability
+        market_context = await _get_market_context(enriched[:3], parsed_jd)
+
+        scored = await run_scoring_agent(enriched, parsed_jd, market_context=market_context)
 
         payment_records = []
         spent = state["total_spent_usdc"]
@@ -538,6 +583,11 @@ class HireFlowOrchestrator:
         )
         tx_count = tx_count_result.scalar() or 0
 
+        # Extract quality fields from intelligence report for fast status polling
+        intel = state.get("intelligence_report") or {}
+        quality_score = int(intel.get("search_quality_score", 0)) if intel else None
+        jd_changes = intel.get("recommended_jd_changes") or []
+
         await self._db.execute(
             update(Search)
             .where(Search.id == search_uuid)
@@ -547,6 +597,8 @@ class HireFlowOrchestrator:
                 transaction_count=tx_count,
                 completed_at=datetime.now(timezone.utc),
                 intelligence_report=state.get("intelligence_report"),
+                search_quality_score=quality_score,
+                recommended_jd_changes=jd_changes,
             )
         )
         await self._db.commit()

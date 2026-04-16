@@ -25,4 +25,6 @@ class TalentIntelligenceReport(BaseModel):
     red_flags: list[str] = Field(default_factory=list)
     recommended_jd_changes: list[str] = Field(default_factory=list)
     interview_plans: list[CandidateInterviewPlan] = Field(default_factory=list)
+    # Phase 4.3: one-sentence market availability note for rare skills
+    market_context_hint: str = ""
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

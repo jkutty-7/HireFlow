@@ -35,6 +35,9 @@ class Search(Base):
     refund_tx_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
     recruiter_wallet_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     intelligence_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Phase 4.2: surfaced from intelligence_report for fast status polling
+    search_quality_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommended_jd_changes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

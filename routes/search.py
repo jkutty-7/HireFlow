@@ -97,6 +97,8 @@ async def get_search_status(
         transaction_count=search.transaction_count,
         created_at=search.created_at,
         completed_at=search.completed_at,
+        search_quality_score=search.search_quality_score,
+        recommended_jd_changes=search.recommended_jd_changes or [],
     )
 
 
@@ -411,31 +413,28 @@ async def export_candidates_csv(
     )
 
 
-@router.get("/{search_id}/intelligence")
+@router.get("/{search_id}/intelligence", response_model=None)
 async def get_intelligence_report(
-    search_id: str,
+    search_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key),
 ):
     """
-    Return the Talent Intelligence Report for a completed search.
-    Includes top-3 summary, red flags, interview questions per candidate, and search quality score.
+    Return the typed TalentIntelligenceReport for a completed search.
+    Validated against the Pydantic model before returning.
     """
-    try:
-        search_uuid = uuid.UUID(search_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid search_id format")
+    from models.intelligence import TalentIntelligenceReport
 
-    result = await db.execute(select(Search).where(Search.id == search_uuid))
+    result = await db.execute(select(Search).where(Search.id == search_id))
     search = result.scalar_one_or_none()
-
     if not search:
         raise HTTPException(status_code=404, detail="Search not found")
-
     if search.status != "complete":
-        raise HTTPException(status_code=202, detail=f"Search is {search.status} — intelligence report not yet available")
-
+        raise HTTPException(
+            status_code=202,
+            detail=f"Search is {search.status} — intelligence report not yet available",
+        )
     if not search.intelligence_report:
-        raise HTTPException(status_code=404, detail="Intelligence report not available for this search")
+        raise HTTPException(status_code=404, detail="Intelligence report not available")
 
-    return search.intelligence_report
+    return TalentIntelligenceReport.model_validate(search.intelligence_report)
