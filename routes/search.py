@@ -217,11 +217,16 @@ async def _run_pipeline(
     """Background task: runs the full orchestrator pipeline."""
     from db.database import AsyncSessionLocal
     from agents.orchestrator import HireFlowOrchestrator
-    from payments.wallet_manager import LocalWalletManager
+    from payments.wallet_manager import LocalWalletManager, WalletManager
+    from settings import settings
     from main import ws_manager  # WebSocket broadcast
 
     async with AsyncSessionLocal() as db:
-        wallet_mgr = LocalWalletManager()
+        wallet_mgr = (
+            WalletManager(db)
+            if settings.use_circle_wallets
+            else LocalWalletManager()
+        )
 
         orchestrator = HireFlowOrchestrator(
             db=db,

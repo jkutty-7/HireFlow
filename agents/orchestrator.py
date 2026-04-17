@@ -588,6 +588,11 @@ class HireFlowOrchestrator:
         quality_score = int(intel.get("search_quality_score", 0)) if intel else None
         jd_changes = intel.get("recommended_jd_changes") or []
 
+        # Refund any unused escrow budget (Phase 5.3)
+        refund_tx = await self._payment_coordinator.refund_unused_escrow(
+            state["search_id"], state["total_spent_usdc"]
+        )
+
         await self._db.execute(
             update(Search)
             .where(Search.id == search_uuid)
@@ -599,6 +604,7 @@ class HireFlowOrchestrator:
                 intelligence_report=state.get("intelligence_report"),
                 search_quality_score=quality_score,
                 recommended_jd_changes=jd_changes,
+                refund_tx_hash=refund_tx,
             )
         )
         await self._db.commit()

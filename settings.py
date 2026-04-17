@@ -73,6 +73,10 @@ class Settings(BaseSettings):
         default_factory=list,
         description="Valid API keys for recruiter routes. Empty list = dev mode (no auth).",
     )
+    use_circle_wallets: bool = Field(
+        default=False,
+        description="Use Circle Programmable Wallets instead of local key-derived wallets",
+    )
 
     # ─── Derived / Computed ───────────────────────────────────
     @property

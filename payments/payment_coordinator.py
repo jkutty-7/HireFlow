@@ -10,6 +10,7 @@ Responsibilities:
   - record_batch()    — persist PaymentLog rows in a single DB commit + broadcast
 """
 
+import asyncio
 import uuid
 import structlog
 
@@ -64,6 +65,17 @@ class PaymentCoordinator:
         broadcast_fn: Optional WebSocket broadcast callable
     """
 
+    # Minimal ABI for PaymentEscrow.refund()
+    ESCROW_REFUND_ABI = [
+        {
+            "name": "refund",
+            "type": "function",
+            "stateMutability": "nonpayable",
+            "inputs": [{"name": "search_id", "type": "bytes32"}],
+            "outputs": [],
+        }
+    ]
+
     def __init__(
         self,
         db: AsyncSession,
@@ -75,6 +87,11 @@ class PaymentCoordinator:
         self._w3 = w3
         self._private_key = private_key
         self._broadcast = broadcast_fn
+
+    def _run_sync(self, fn, *args, **kwargs):
+        """Run a synchronous web3 call in the default thread pool."""
+        loop = asyncio.get_event_loop()
+        return loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
     async def deposit_escrow(self, search_id: str, budget_usdc: float = 0.30) -> str | None:
         """
@@ -97,33 +114,45 @@ class PaymentCoordinator:
                 address=Web3.to_checksum_address(settings.usdc_contract_address),
                 abi=USDC_APPROVE_ABI,
             )
+            nonce = await self._run_sync(
+                self._w3.eth.get_transaction_count, account.address
+            )
+            gas_price = await self._run_sync(lambda: self._w3.eth.gas_price)
             approve_tx = usdc.functions.approve(
                 Web3.to_checksum_address(settings.payment_escrow_address),
                 budget_units,
             ).build_transaction({
                 "from":     account.address,
-                "nonce":    self._w3.eth.get_transaction_count(account.address),
+                "nonce":    nonce,
                 "gas":      100_000,
-                "gasPrice": self._w3.eth.gas_price,
+                "gasPrice": gas_price,
             })
             signed = self._w3.eth.account.sign_transaction(approve_tx, self._private_key)
-            self._w3.eth.send_raw_transaction(signed.raw_transaction)
+            await self._run_sync(self._w3.eth.send_raw_transaction, signed.raw_transaction)
 
             escrow = self._w3.eth.contract(
                 address=Web3.to_checksum_address(settings.payment_escrow_address),
                 abi=ESCROW_DEPOSIT_ABI,
             )
+            nonce2 = await self._run_sync(
+                self._w3.eth.get_transaction_count, account.address
+            )
+            gas_price2 = await self._run_sync(lambda: self._w3.eth.gas_price)
             deposit_tx = escrow.functions.deposit(
                 search_id_bytes, budget_units
             ).build_transaction({
                 "from":     account.address,
-                "nonce":    self._w3.eth.get_transaction_count(account.address),
+                "nonce":    nonce2,
                 "gas":      200_000,
-                "gasPrice": self._w3.eth.gas_price,
+                "gasPrice": gas_price2,
             })
-            signed = self._w3.eth.account.sign_transaction(deposit_tx, self._private_key)
-            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            signed2 = self._w3.eth.account.sign_transaction(deposit_tx, self._private_key)
+            tx_hash = await self._run_sync(
+                self._w3.eth.send_raw_transaction, signed2.raw_transaction
+            )
+            receipt = await self._run_sync(
+                self._w3.eth.wait_for_transaction_receipt, tx_hash, 60
+            )
 
             if receipt.get("status") == 0:
                 log.error("escrow_deposit_reverted", tx=tx_hash.hex())
@@ -134,6 +163,56 @@ class PaymentCoordinator:
 
         except Exception as exc:
             log.error("escrow_deposit_failed", error=str(exc))
+            return None
+
+    async def refund_unused_escrow(
+        self, search_id: str, total_spent_usdc: float, budget_usdc: float = 0.30
+    ) -> str | None:
+        """
+        Refund any unused escrow budget to the recruiter.
+        Returns the refund tx hash, or None if no refund is needed / contract unavailable.
+        """
+        if not settings.payment_escrow_address:
+            return None
+
+        unused = budget_usdc - total_spent_usdc
+        if unused <= 0:
+            return None
+
+        search_id_bytes = bytes.fromhex(search_id.replace("-", ""))[:32]
+        try:
+            account = self._w3.eth.account.from_key(self._private_key)
+            escrow = self._w3.eth.contract(
+                address=Web3.to_checksum_address(settings.payment_escrow_address),
+                abi=self.ESCROW_REFUND_ABI,
+            )
+            nonce = await self._run_sync(
+                self._w3.eth.get_transaction_count, account.address
+            )
+            gas_price = await self._run_sync(lambda: self._w3.eth.gas_price)
+            tx = escrow.functions.refund(search_id_bytes).build_transaction({
+                "from":     account.address,
+                "nonce":    nonce,
+                "gas":      200_000,
+                "gasPrice": gas_price,
+            })
+            signed = self._w3.eth.account.sign_transaction(tx, self._private_key)
+            tx_hash = await self._run_sync(
+                self._w3.eth.send_raw_transaction, signed.raw_transaction
+            )
+            receipt = await self._run_sync(
+                self._w3.eth.wait_for_transaction_receipt, tx_hash, 60
+            )
+
+            if receipt.get("status") == 0:
+                log.error("refund_reverted", tx=tx_hash.hex())
+                return None
+
+            log.info("escrow_refunded", search_id=search_id, unused_usdc=unused, tx=tx_hash.hex())
+            return tx_hash.hex()
+
+        except Exception as exc:
+            log.error("refund_failed", search_id=search_id, error=str(exc))
             return None
 
     async def record_batch(self, search_id: str, records: list[dict]) -> None:
